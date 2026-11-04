@@ -146,8 +146,12 @@ async def fleet(request: web.Request) -> web.Response:
 async def tunnel_next(request: web.Request) -> web.Response:
     run = server_run(request)
     run.last_poll = time.time()
+    deadline = time.time() + POLL_TIMEOUT
     try:
-        rid, path, hdrs, body = await asyncio.wait_for(run.queue.get(), POLL_TIMEOUT)
+        while True:
+            rid, path, hdrs, body = await asyncio.wait_for(run.queue.get(), max(deadline - time.time(), 0))
+            if rid in run.pending:  # else the client already got a 504; don't replay it
+                break
     except asyncio.TimeoutError:
         run.last_poll = time.time()
         return web.Response(status=204)

@@ -1,0 +1,19 @@
+# One server block for every token: <token>.broker.example.com -> broker on loopback.
+server {
+    listen 443 ssl;
+    server_name *.broker.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/broker.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/broker.example.com/privkey.pem;
+
+    client_max_body_size 1g;        # matches the broker's client_max_size
+    proxy_request_buffering off;    # stream large model updates instead of spooling to disk
+    proxy_buffering off;
+    proxy_read_timeout 120s;        # above the 25s long poll and the 60s request timeout
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;  # the broker reads the token from this
+    }
+}

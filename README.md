@@ -34,6 +34,7 @@ Set these environment variables. `env.example` is a template.
 | `HOST` | `127.0.0.1` | Address to listen on. |
 | `PORT` | `8080` | Port to listen on. |
 | `RUN_TTL` | `21600` | Hard limit in seconds on a run. Heartbeats do not extend it. |
+| `VERBOSE` | unset | Set to `1` to log every request. Lifecycle events and auth failures always log. |
 | `LEASE_SECONDS` | `0` | Seconds a run lives without `POST /heartbeat`. `0` turns the lease off. |
 
 ## Deploy
@@ -45,7 +46,7 @@ Set these environment variables. `env.example` is a template.
 5. Install the dependencies: `pip install -r requirements.txt`.
 6. Load `.env` into the environment and start the broker: `python broker.py`.
 
-The nginx configuration forwards the `Host` header, because the broker reads the token from it. It also allows request bodies up to 1 GB, turns off buffering, and sets a read timeout above the broker timeouts.
+The nginx configuration forwards the `Host` header, because the broker reads the token from it. It also sets `X-Forwarded-For` to the real client address, which the broker logs. It also allows request bodies up to 1 GB, turns off buffering, and sets a read timeout above the broker timeouts.
 
 ## Server endpoints
 

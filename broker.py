@@ -18,6 +18,7 @@ BASE_DOMAIN = os.environ["BASE_DOMAIN"].lower()  # e.g. broker.example.com
 MASTER_SECRET = os.environ["MASTER_SECRET"].encode()  # only authorises /register
 RUN_TTL = int(os.environ.get("RUN_TTL", 6 * 3600))  # seconds until an unrevoked run expires
 LEASE = int(os.environ.get("LEASE_SECONDS", 0))  # heartbeat lease; 0 = no lease, only RUN_TTL applies
+VERBOSE = os.environ.get("VERBOSE") == "1"  # also log every request (noisy: /next, /heartbeat, /alive)
 REQ_TIMEOUT = 60  # seconds a SuperNode waits for the SuperLink's reply
 POLL_TIMEOUT = 25  # seconds a wrapper poll waits for work
 TOKEN_RE = re.compile(r"[0-9a-f]{16,63}")  # one DNS label, lowercase hex
@@ -43,11 +44,35 @@ class Run:
     pending: dict[str, asyncio.Future] = field(default_factory=dict)
     clients: dict[str, bool] = field(default_factory=dict)  # client token -> has registered
     last_poll: float = 0.0
+    wrapper_up: bool = False  # only to log wrapper connect/silent once per change
     stats: dict[str, list] = field(default_factory=dict)  # path -> [count, total_seconds]
 
 
 runs: dict[str, Run] = {}  # server token -> run
 clients: dict[str, Run] = {}  # client token -> run
+
+
+def log(*a) -> None:
+    print(*a, flush=True)  # never log secrets or full tokens: use S()/C()/tag()
+
+
+def S(tok: str) -> str:  # server token (the run / its wrapper)
+    return f"[S]{tok[:6]}"
+
+
+def C(tok: str) -> str:  # client token (one SuperNode)
+    return f"[C]{tok[:6]}"
+
+
+def tag(tok: str | None) -> str:  # role from the tables; [?] if unknown or already dropped
+    if not tok:
+        return "[?]-"
+    return S(tok) if tok in runs else C(tok) if tok in clients else f"[?]{tok[:6]}"
+
+
+def ip(request: web.Request) -> str | None:
+    # nginx sets X-Forwarded-For to the real peer; spoofable if the broker is exposed directly
+    return request.headers.get("X-Forwarded-For") or request.remote
 
 
 def host_token(request: web.Request) -> str | None:
@@ -56,7 +81,8 @@ def host_token(request: web.Request) -> str | None:
     return tok if tok != host and TOKEN_RE.fullmatch(tok) else None
 
 
-def drop(run: Run) -> None:
+def drop(run: Run, why: str) -> None:
+    log(f"{S(run.token)} run ended: {why}")
     runs.pop(run.token, None)
     run.queue.put_nowait(None)  # wake a /next poller blocked on this run
     for c in run.clients:
@@ -69,7 +95,7 @@ def drop(run: Run) -> None:
 def lookup(table: dict[str, Run], tok: str | None) -> Run | None:
     run = table.get(tok)
     if run and min(run.expires, run.lease) < time.time():  # lazy check; sweep() covers idle runs
-        drop(run)
+        drop(run, "lease lapsed" if run.lease < run.expires else "RUN_TTL reached")
         return None
     return run
 
@@ -88,6 +114,8 @@ def same(a: str, b: bytes) -> bool:
 def server_run(request: web.Request) -> Run:
     run = lookup(runs, host_token(request))
     if not run or not same(request.headers.get("X-Run-Secret", ""), run.secret.encode()):
+        log(f"{tag(host_token(request))} {ip(request)} {request.path} denied: "
+            f"{'wrong run secret' if run else 'no live run'}")
         raise web.HTTPForbidden()
     return run
 
@@ -95,10 +123,13 @@ def server_run(request: web.Request) -> Run:
 async def register(request: web.Request) -> web.Response:
     tok = host_token(request)
     if not tok or not same(request.headers.get("X-Master-Secret", ""), MASTER_SECRET):
+        log(f"{tag(tok)} {ip(request)} register denied: wrong master secret")
         return web.Response(status=403)
     if lookup(runs, tok) or tok in clients:
+        log(f"{tag(tok)} {ip(request)} register denied: token in use")
         return web.Response(status=409)
     run = runs[tok] = Run(tok, secrets.token_urlsafe(32))
+    log(f"{S(tok)} {ip(request)} registered (lease={str(LEASE) + 's' if LEASE else 'off'}, ttl={RUN_TTL}s)")
     return web.json_response({"run_secret": run.secret})
 
 
@@ -111,6 +142,7 @@ async def mint(request: web.Request) -> web.Response:
     for t in toks:
         run.clients[t] = False
         clients[t] = run
+    log(f"{S(run.token)} minted {n} client tokens")
     return web.json_response({"tokens": toks})
 
 
@@ -122,8 +154,9 @@ async def revoke(request: web.Request) -> web.Response:
     run = runs.get(host_token(request))  # no lookup: an expired run is already gone -> 204
     if run:
         if not same(request.headers.get("X-Run-Secret", ""), run.secret.encode()):
+            log(f"{S(run.token)} {ip(request)} revoke denied: wrong run secret")
             raise web.HTTPForbidden()
-        drop(run)
+        drop(run, "revoked")
     return web.Response(status=204)
 
 
@@ -151,6 +184,9 @@ async def fleet(request: web.Request) -> web.Response:
     if not run or path not in FLEET:
         return web.Response(status=404, text="not found")
     if time.time() - run.last_poll > POLL_TIMEOUT + 5:
+        if run.wrapper_up:
+            run.wrapper_up = False
+            log(f"{S(run.token)} wrapper silent; Fleet calls get 503")
         return web.Response(status=503, text="no SuperLink wrapper connected")
     t0 = time.time()
     rid = uuid.uuid4().hex
@@ -160,6 +196,7 @@ async def fleet(request: web.Request) -> web.Response:
     try:
         status, rhdrs, body = await asyncio.wait_for(fut, REQ_TIMEOUT)
     except asyncio.TimeoutError:
+        log(f"{S(run.token)} <- {C(tok)} {path} -> 504 wrapper did not reply in {REQ_TIMEOUT}s")
         return web.Response(status=504, text="SuperLink did not reply in time")
     finally:
         run.pending.pop(rid, None)
@@ -169,14 +206,17 @@ async def fleet(request: web.Request) -> web.Response:
     s[1] += dt
     if path.endswith("/register-node") and status < 300 and tok in run.clients:
         run.clients[tok] = True
-    print(f"{run.token[:6]}/{tok[:6]} {request.remote} POST {path} -> {status} {dt*1000:.1f}ms "
-          f"req={request.content_length}B resp={len(body)}B", flush=True)
+    log(f"{S(run.token)} <- {C(tok)} {ip(request)} POST {path} -> {status} {dt*1000:.1f}ms "
+          f"req={request.content_length}B resp={len(body)}B")
     return web.Response(status=status, headers=rhdrs, body=body)
 
 
 async def tunnel_next(request: web.Request) -> web.Response:
     run = server_run(request)
     run.last_poll = time.time()
+    if not run.wrapper_up:
+        run.wrapper_up = True
+        log(f"{S(run.token)} {ip(request)} wrapper connected")
     deadline = time.time() + POLL_TIMEOUT
     try:
         while True:
@@ -208,8 +248,23 @@ async def stats_view(request: web.Request) -> web.Response:
                               for p, (n, t) in server_run(request).stats.items()})
 
 
+@web.middleware
+async def access(request: web.Request, handler) -> web.StreamResponse:
+    t0, status, who = time.time(), 500, tag(host_token(request))  # before the handler can drop the run
+    try:
+        resp = await handler(request)
+        status = resp.status
+        return resp
+    except web.HTTPException as e:
+        status = e.status
+        raise
+    finally:
+        log(f"{who} {ip(request)} {request.method} {request.path} "
+            f"-> {status} {(time.time() - t0)*1000:.1f}ms")
+
+
 async def main() -> None:
-    app = web.Application(client_max_size=1 << 30)
+    app = web.Application(client_max_size=1 << 30, middlewares=[access] if VERBOSE else [])
     app.router.add_post("/register", register)
     app.router.add_post("/mint", mint)
     app.router.add_get("/status", run_status)

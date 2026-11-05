@@ -17,6 +17,7 @@ from aiohttp import web
 BASE_DOMAIN = os.environ["BASE_DOMAIN"].lower()  # e.g. broker.example.com
 MASTER_SECRET = os.environ["MASTER_SECRET"].encode()  # only authorises /register
 RUN_TTL = int(os.environ.get("RUN_TTL", 6 * 3600))  # seconds until an unrevoked run expires
+LEASE = int(os.environ.get("LEASE_SECONDS", 0))  # heartbeat lease; 0 = no lease, only RUN_TTL applies
 REQ_TIMEOUT = 60  # seconds a SuperNode waits for the SuperLink's reply
 POLL_TIMEOUT = 25  # seconds a wrapper poll waits for work
 TOKEN_RE = re.compile(r"[0-9a-f]{16,63}")  # one DNS label, lowercase hex
@@ -37,6 +38,7 @@ class Run:
     token: str  # the server token
     secret: str  # proves the caller on a server-token host is the real wrapper
     expires: float = field(default_factory=lambda: time.time() + RUN_TTL)
+    lease: float = field(default_factory=lambda: time.time() + LEASE if LEASE else float("inf"))
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     pending: dict[str, asyncio.Future] = field(default_factory=dict)
     clients: dict[str, bool] = field(default_factory=dict)  # client token -> has registered
@@ -56,6 +58,7 @@ def host_token(request: web.Request) -> str | None:
 
 def drop(run: Run) -> None:
     runs.pop(run.token, None)
+    run.queue.put_nowait(None)  # wake a /next poller blocked on this run
     for c in run.clients:
         clients.pop(c, None)
     for fut in run.pending.values():
@@ -65,10 +68,17 @@ def drop(run: Run) -> None:
 
 def lookup(table: dict[str, Run], tok: str | None) -> Run | None:
     run = table.get(tok)
-    if run and run.expires < time.time():  # expiry is checked lazily; no sweeper task
+    if run and min(run.expires, run.lease) < time.time():  # lazy check; sweep() covers idle runs
         drop(run)
         return None
     return run
+
+
+async def sweep() -> None:
+    while True:
+        await asyncio.sleep(1)
+        for run in list(runs.values()):
+            lookup(runs, run.token)
 
 
 def same(a: str, b: bytes) -> bool:
@@ -86,7 +96,7 @@ async def register(request: web.Request) -> web.Response:
     tok = host_token(request)
     if not tok or not same(request.headers.get("X-Master-Secret", ""), MASTER_SECRET):
         return web.Response(status=403)
-    if tok in runs or tok in clients:
+    if lookup(runs, tok) or tok in clients:
         return web.Response(status=409)
     run = runs[tok] = Run(tok, secrets.token_urlsafe(32))
     return web.json_response({"run_secret": run.secret})
@@ -109,8 +119,29 @@ async def run_status(request: web.Request) -> web.Response:
 
 
 async def revoke(request: web.Request) -> web.Response:
-    drop(server_run(request))
+    run = runs.get(host_token(request))  # no lookup: an expired run is already gone -> 204
+    if run:
+        if not same(request.headers.get("X-Run-Secret", ""), run.secret.encode()):
+            raise web.HTTPForbidden()
+        drop(run)
     return web.Response(status=204)
+
+
+async def heartbeat(request: web.Request) -> web.Response:
+    run = server_run(request)
+    if LEASE:
+        run.lease = time.time() + LEASE
+    return web.json_response({"remaining": round(min(run.expires, run.lease) - time.time(), 1)})
+
+
+async def alive(request: web.Request) -> web.Response:
+    tok = host_token(request)
+    if not tok:
+        return web.Response(status=404)
+    run = lookup(runs, tok) or lookup(clients, tok)
+    if not run:  # expired, revoked and never-existed look the same on purpose
+        return web.Response(status=410)
+    return web.json_response({"remaining": round(min(run.expires, run.lease) - time.time(), 1)})
 
 
 async def fleet(request: web.Request) -> web.Response:
@@ -149,7 +180,10 @@ async def tunnel_next(request: web.Request) -> web.Response:
     deadline = time.time() + POLL_TIMEOUT
     try:
         while True:
-            rid, path, hdrs, body = await asyncio.wait_for(run.queue.get(), max(deadline - time.time(), 0))
+            item = await asyncio.wait_for(run.queue.get(), max(deadline - time.time(), 0))
+            if item is None:  # run ended while polling
+                return web.Response(status=403)
+            rid, path, hdrs, body = item
             if rid in run.pending:  # else the client already got a 504; don't replay it
                 break
     except asyncio.TimeoutError:
@@ -180,6 +214,8 @@ async def main() -> None:
     app.router.add_post("/mint", mint)
     app.router.add_get("/status", run_status)
     app.router.add_post("/revoke", revoke)
+    app.router.add_post("/heartbeat", heartbeat)
+    app.router.add_get("/alive", alive)
     app.router.add_get("/next", tunnel_next)
     app.router.add_post("/reply/{rid}", tunnel_reply)
     app.router.add_get("/stats", stats_view)
@@ -189,7 +225,7 @@ async def main() -> None:
     # behind nginx on the same host, so loopback by default
     await web.TCPSite(r, os.environ.get("HOST", "127.0.0.1"), int(os.environ.get("PORT", 8080))).start()
     print(f"broker: *.{BASE_DOMAIN} on :{os.environ.get('PORT', 8080)}", flush=True)
-    await asyncio.Event().wait()
+    await sweep()
 
 
 asyncio.run(main())

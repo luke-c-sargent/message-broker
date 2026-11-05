@@ -33,7 +33,8 @@ Set these environment variables. `env.example` is a template.
 | `MASTER_SECRET` | required | Secret that permits `/register`. |
 | `HOST` | `127.0.0.1` | Address to listen on. |
 | `PORT` | `8080` | Port to listen on. |
-| `RUN_TTL` | `21600` | Seconds until a run expires. |
+| `RUN_TTL` | `21600` | Hard limit in seconds on a run. Heartbeats do not extend it. |
+| `LEASE_SECONDS` | `0` | Seconds a run lives without `POST /heartbeat`. `0` turns the lease off. |
 
 ## Deploy
 
@@ -55,9 +56,10 @@ Send these to `<server-token>.<base-domain>`. Every endpoint except `/register` 
 | `POST /register` | Header `X-Master-Secret`. | `200` with `{"run_secret": "..."}`. `403` for a wrong secret. `409` if the token exists. |
 | `POST /mint` | JSON `{"n": 1..64}`. | `{"tokens": [...]}`. Each token is a client token. |
 | `GET /status` | None. | JSON map of client token to `true` or `false`. A value is `true` after that SuperNode registers. |
-| `POST /revoke` | None. | `204`. The run ends. |
+| `POST /revoke` | None. | `204`. The run ends. Also `204` if the run is already gone. |
 | `GET /next` | None. | Waits up to 25 seconds. `204` if no work. Otherwise `200` with the request body and the headers that follow. |
 | `POST /reply/{rid}` | Response body. Headers `X-Status` and `X-Resp-Headers` (JSON). | `204`. |
+| `POST /heartbeat` | None. | `200` with `{"remaining": seconds}`. Renews the lease. `403` if the run is gone. |
 | `GET /stats` | None. | Request count and average milliseconds for each path. |
 
 Headers on a `/next` response:
@@ -92,3 +94,15 @@ Error responses:
 | `404` | Unknown token, or a path that is not in the allowlist. |
 | `503` | The wrapper has not polled `/next` for more than 30 seconds. |
 | `504` | The wrapper did not reply within 60 seconds. |
+
+## Liveness
+
+`GET /alive` needs no secret. Send it to any server or client token host. It does not renew the lease.
+
+| Status | Meaning |
+|---|---|
+| `200` | `{"remaining": seconds}`. The run is live. |
+| `410` | The run expired, was revoked, or the token is unknown. |
+| `404` | The host has no valid token label. |
+
+Test: `python smoke_test.py`.

@@ -17,7 +17,7 @@ from aiohttp import web
 BASE_DOMAIN = os.environ["BASE_DOMAIN"].lower()  # e.g. broker.example.com
 MASTER_SECRET = os.environ["MASTER_SECRET"].encode()  # only authorises /register
 RUN_TTL = int(os.environ.get("RUN_TTL", 6 * 3600))  # seconds until an unrevoked run expires
-LEASE = int(os.environ.get("LEASE_SECONDS", 0))  # heartbeat lease; 0 = no lease, only RUN_TTL applies
+LEASE = int(os.environ.get("LEASE_SECONDS", 120))  # heartbeat lease; 0 = no lease, only RUN_TTL applies
 VERBOSE = os.environ.get("VERBOSE") == "1"  # also log every request (noisy: /next, /heartbeat, /alive)
 REQ_TIMEOUT = 60  # seconds a SuperNode waits for the SuperLink's reply
 POLL_TIMEOUT = 25  # seconds a wrapper poll waits for work

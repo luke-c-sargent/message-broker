@@ -35,7 +35,7 @@ Set these environment variables. `env.example` is a template.
 | `PORT` | `8080` | Port to listen on. |
 | `RUN_TTL` | `21600` | Hard limit in seconds on a run. Heartbeats do not extend it. |
 | `VERBOSE` | unset | Set to `1` to log every request. Lifecycle events and auth failures always log. |
-| `LEASE_SECONDS` | `0` | Seconds a run lives without `POST /heartbeat`. `0` turns the lease off. |
+| `LEASE_SECONDS` | `120` | Seconds a run lives without `POST /heartbeat`. `0` turns the lease off. |
 
 ## Deploy
 

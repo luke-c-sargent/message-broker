@@ -1,3 +1,11 @@
+# Rate limit only /register: it is the one unauthenticated way to guess the master secret.
+# An empty key is not limited, so Fleet, /next and /alive traffic is never throttled.
+map $uri $register_key {
+    default   "";
+    /register $binary_remote_addr;
+}
+limit_req_zone $register_key zone=register:1m rate=10r/m;
+
 # One server block for every token: <token>.broker.example.com -> broker on loopback.
 server {
     listen 443 ssl;
@@ -12,6 +20,8 @@ server {
     proxy_read_timeout 120s;        # above the 25s long poll and the 60s request timeout
 
     location / {
+        limit_req zone=register burst=5 nodelay;  # over the limit: 429, one line in nginx error.log
+        limit_req_status 429;
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $host;  # the broker reads the token from this

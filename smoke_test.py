@@ -1,5 +1,5 @@
 """Lease smoke test: starts the broker with a short LEASE_SECONDS and drives it over HTTP."""
-import http.client, json, os, subprocess, sys, time
+import http.client, json, os, socket, subprocess, sys, threading, time
 
 PORT, DOM, TTL = 18080, "t.example", 2
 SRV = "a" * 32
@@ -56,11 +56,37 @@ try:
 
     # pending /next is woken when the run is revoked
     t0 = time.time()
-    import threading
     threading.Timer(1, lambda: call(SRV, "POST", "/revoke", H)).start()
     assert call(SRV, "GET", "/next", H)[0] == 403 and time.time() - t0 < 5
     assert call(SRV, "POST", "/revoke", H)[0] == 204 and call(SRV, "GET", "/alive")[0] == 410
     assert call("f" * 32, "GET", "/alive")[0] == 410  # unknown token
+
+    # Fleet relay end to end: client -> broker -> fake wrapper (/next, /reply) -> client
+    st, body = register(); assert st == 200
+    H = {"X-Run-Secret": body["run_secret"]}
+    cli = call(SRV, "POST", "/mint", H, {"n": 1})[1]["tokens"][0]
+
+    def wrapper():
+        while True:
+            c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=30)
+            c.request("GET", "/next", headers={"Host": f"{SRV}.{DOM}", **H}); r = c.getresponse(); r.read()
+            if r.status == 200:
+                call(SRV, "POST", "/reply/" + r.getheader("X-Req-Id"), {**H, "X-Status": "200", "X-Resp-Headers": "{}"})
+                return
+
+    th = threading.Thread(target=wrapper); th.start(); time.sleep(0.5)
+    assert call(cli, "POST", "/v1/fleet/get-run")[0] == 200
+    th.join()
+
+    # a /next poll whose wrapper hung up must not swallow the next client request
+    dead = socket.create_connection(("127.0.0.1", PORT))
+    dead.sendall(f"GET /next HTTP/1.1\r\nHost: {SRV}.{DOM}\r\nX-Run-Secret: {H['X-Run-Secret']}\r\n\r\n".encode())
+    time.sleep(0.5); dead.close(); call(SRV, "POST", "/heartbeat", H)  # handler keeps waiting on the queue, first in line
+    th = threading.Thread(target=wrapper); th.start(); time.sleep(0.5); call(SRV, "POST", "/heartbeat", H)  # the live poll, second in line
+    t0 = time.time()
+    assert call(cli, "POST", "/v1/fleet/get-run")[0] == 200 and time.time() - t0 < 5  # else 504 after 60s
+    th.join()
+    assert call(SRV, "POST", "/revoke", H)[0] == 204
     print("ok")
 finally:
     p.terminate()

@@ -114,7 +114,7 @@ def same(a: str, b: bytes) -> bool:
 def server_run(request: web.Request) -> Run:
     run = lookup(runs, host_token(request))
     if not run or not same(request.headers.get("X-Run-Secret", ""), run.secret.encode()):
-        log(f"{tag(host_token(request))} {ip(request)} {request.path} denied: "
+        log(f"{tag(host_token(request))} {ip(request)} {request.path!r} denied: "
             f"{'wrong run secret' if run else 'no live run'}")
         raise web.HTTPForbidden()
     return run
@@ -227,7 +227,11 @@ async def tunnel_next(request: web.Request) -> web.Response:
             if rid in run.pending:  # else the client already got a 504; don't replay it
                 break
     except asyncio.TimeoutError:
-        run.last_poll = time.time()
+        if request.transport:  # a hung-up poll is not proof the wrapper is alive
+            run.last_poll = time.time()
+        return web.Response(status=204)
+    if request.transport is None:  # wrapper hung up while we waited: hand the request to a live poll
+        run.queue.put_nowait(item)
         return web.Response(status=204)
     run.last_poll = time.time()
     return web.Response(body=body, headers={
@@ -259,8 +263,11 @@ async def access(request: web.Request, handler) -> web.StreamResponse:
         status = e.status
         raise
     finally:
-        log(f"{who} {ip(request)} {request.method} {request.path} "
-            f"-> {status} {(time.time() - t0)*1000:.1f}ms")
+        if who.startswith("[?]"):  # e.g. /register creates the run inside the handler
+            who = tag(host_token(request))
+        gone = " (client hung up)" if request.transport is None else ""  # aiohttp keeps running the handler
+        log(f"{who} {ip(request)} {request.method} {request.path!r} "
+            f"-> {status} {(time.time() - t0)*1000:.1f}ms{gone}")
 
 
 async def main() -> None:

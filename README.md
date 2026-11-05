@@ -46,7 +46,7 @@ Set these environment variables. `env.example` is a template.
 5. Install the dependencies: `pip install -r requirements.txt`.
 6. Load `.env` into the environment and start the broker: `python broker.py`.
 
-The nginx configuration forwards the `Host` header, because the broker reads the token from it. It also sets `X-Forwarded-For` to the real client address, which the broker logs. It also allows request bodies up to 1 GB, turns off buffering, and sets a read timeout above the broker timeouts.
+The nginx configuration forwards the `Host` header, because the broker reads the token from it. It limits `/register` to 10 requests per minute per address (burst 5), so a guessing attack shows up as `429` lines in the nginx error log and cannot flood the broker log. It also sets `X-Forwarded-For` to the real client address, which the broker logs. It also allows request bodies up to 1 GB, turns off buffering, and sets a read timeout above the broker timeouts.
 
 ## Server endpoints
 

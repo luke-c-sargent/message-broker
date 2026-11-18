@@ -1,0 +1,269 @@
+openapi: 3.0.3
+info:
+  title: Message broker HTTP API
+  version: "0.4"
+  description: |
+    The broker's HTTP API, as described in `spec.md` (sections 9 and 10). The broker never starts a
+    connection. A node or the launcher calls it. Frames are opaque bytes; their layout is in
+    `spec.md` section 5.
+
+    Every request except `POST /sessions` carries `Authorization: Bearer <credential>`.
+    A reverse proxy must rate-limit `POST /sessions` per source address (it is the only way to
+    guess the master secret).
+servers:
+  - url: https://broker.example.com
+security:
+  - bearer: []
+paths:
+  /sessions:
+    post:
+      summary: Register a session (launcher)
+      security:
+        - masterSecret: []
+      responses:
+        "201":
+          description: Session created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, credential]
+                properties:
+                  session_id: {type: string}
+                  credential: {type: string, description: Admin credential. Keep it secret.}
+        "401": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    delete:
+      summary: End the session (admin). Idempotent.
+      responses:
+        "204": {description: The session is gone.}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/nodes:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    post:
+      summary: Mint node credentials (admin)
+      description: |
+        All or nothing. An address that has not joined yet is minted again with a new credential
+        (the old one stops working). An address that has joined gives `conflict`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [addresses]
+              properties:
+                addresses:
+                  type: array
+                  items: {type: string, pattern: "^[A-Za-z0-9_-]{1,64}$"}
+      responses:
+        "200":
+          description: Map of address to node credential.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {type: string}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/heartbeat:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    post:
+      summary: Renew the lease (admin)
+      responses:
+        "200": {$ref: "#/components/responses/Remaining"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/alive:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    get:
+      summary: Is the session alive (any credential)
+      responses:
+        "200": {$ref: "#/components/responses/Remaining"}
+        "401": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/presence:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    get:
+      summary: Which nodes have joined (admin)
+      responses:
+        "200":
+          description: Map of address to presence.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: object
+                  required: [joined, last_seen]
+                  properties:
+                    joined: {type: boolean}
+                    last_seen: {type: number, nullable: true, description: "Broker clock, in seconds."}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/stats:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    get:
+      summary: Queue sizes (admin)
+      responses:
+        "200":
+          description: Counters.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_bytes, nodes]
+                properties:
+                  session_bytes: {type: integer}
+                  nodes:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        frames: {type: integer}
+                        bytes: {type: integer}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/info:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    get:
+      summary: Broker limits (any credential)
+      responses:
+        "200":
+          description: Capabilities.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [spec_version, max_frame, frame_ttl]
+                properties:
+                  spec_version: {type: string}
+                  max_frame: {type: integer, description: Largest whole frame in bytes.}
+                  frame_ttl: {type: number, description: "Longest queue time of a frame, in seconds."}
+        "401": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/send/{dest}:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+      - {name: dest, in: path, required: true, schema: {type: string}, description: Address of a live node.}
+    post:
+      summary: Put one frame in a node's queue (node)
+      parameters:
+        - name: ttl
+          in: query
+          schema: {type: number, exclusiveMinimum: true, minimum: 0}
+          description: Seconds the frame may wait in the queue. Default and maximum is `frame_ttl`.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "204": {description: The frame is queued.}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "429": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/recv:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    get:
+      summary: Long poll for frames in the caller's own queue (node)
+      description: |
+        Returns at least one frame, or `204` after `wait` seconds. Each frame must be acknowledged
+        with `POST /ack` soon after receipt, or it is delivered again after `ack_timeout`.
+        The body is a series of records. Each record is: 4 bytes record length (big-endian),
+        8 bytes delivery id (big-endian), 1 byte source length, the source address (UTF-8), then the
+        frame bytes (the rest of the record).
+      parameters:
+        - name: wait
+          in: query
+          schema: {type: number, minimum: 0, default: 0}
+          description: Seconds to wait for a frame. The server caps it at 30.
+      responses:
+        "200":
+          description: One or more records.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "204": {description: No frame arrived in time.}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+  /sessions/{sid}/ack:
+    parameters:
+      - {$ref: "#/components/parameters/sid"}
+    post:
+      summary: Acknowledge received frames (node)
+      description: Unknown ids are ignored, so an ack can be repeated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items: {type: integer}
+      responses:
+        "204": {description: Acknowledged.}
+        "400": {$ref: "#/components/responses/Error"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "410": {$ref: "#/components/responses/Error"}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer}
+    masterSecret: {type: apiKey, in: header, name: X-Master-Secret}
+  parameters:
+    sid:
+      name: sid
+      in: path
+      required: true
+      schema: {type: string}
+  responses:
+    Remaining:
+      description: Seconds left before the lease or the hard ttl ends the session.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [remaining]
+            properties:
+              remaining: {type: number}
+    Error:
+      description: |
+        An error. `error` is the abstract code of `spec.md` section 8. Status mapping:
+        unauthorized 401, forbidden 403, session_gone 410, unknown_dest 404, conflict 409,
+        queue_full 429 (with `Retry-After`), too_large 413, bad_frame 400, unavailable 503.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: string
+                enum: [unauthorized, forbidden, session_gone, unknown_dest, conflict, queue_full,
+                       too_large, bad_frame, unavailable]
+              detail: {type: string}

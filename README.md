@@ -1,109 +1,81 @@
 # Message broker
 
-The broker lets Flower SuperNodes reach a SuperLink that has no inbound network access. The broker is the only listener. The SuperLink side makes outbound calls only.
+Nodes that cannot accept inbound connections can still exchange messages. Every node makes outbound HTTP calls to a **broker**. The broker holds frames in queues and hands them to the node they are addressed to.
 
-Requirements: Python 3.10 or newer, and the packages in `requirements.txt`.
+The design and the glossary are in [docs/spec.md](docs/spec.md). The HTTP endpoints are in [docs/openapi.yaml](docs/openapi.yaml).
 
-## How it works
+Requirements: Python 3.10 or newer.
 
-Three parts take part in a run:
+## Layout
 
-- **SuperNode**: sends Fleet API requests to the broker.
-- **Broker**: holds each request until the wrapper replies.
-- **Wrapper**: runs beside the SuperLink. It polls the broker, replays each request against the local SuperLink, and sends the response back.
+| Path (`src/message_broker/`) | What it is | State |
+|---|---|---|
+| `frames.py`, `errors.py`, `types.py` | Frame format, error codes, shared types. | done |
+| `broker/core.py` | Sessions, credentials, limits, lease. All the policy. | done |
+| `broker/store.py` | The store interface and the in-memory store. | done |
+| `broker/server.py` | The broker's HTTP API. | done |
+| `client/http.py` | HTTP client for a broker, and `connect()`. | done |
+| `client/endpoint.py` | A node's RPC calls over a connection. | done |
+| `client/launcher.py` | The launcher role: register, mint, heartbeat, wait for nodes, revoke. | done |
+| `adapters/flower.py` | Flower adapter: `hub` beside the SuperLink, `spoke` beside each SuperNode. | done |
+| Stream channels | For byte tunnels (FLARE). | not started |
+| FLARE adapter | Needs stream channels. | not started |
+| Other stores (NATS, ...) | | not started |
 
-The broker identifies every caller by the first label of the `Host` header: `<token>.<base-domain>`. A token is lowercase hex, 16 to 63 characters.
+## Run a broker
 
-There are two kinds of token:
-
-- **Server token**: made by `/register`. It belongs to the wrapper and the run owner. Its requests also need the `X-Run-Secret` header.
-- **Client token**: made by `/mint`. It belongs to one SuperNode. It can send only the Fleet paths in the allowlist.
-
-A run ends when `/revoke` is called or when `RUN_TTL` seconds pass. At that time the broker removes all tokens of the run.
-
-The broker keeps all state in memory in one process.
-
-## Configuration
-
-Set these environment variables. `env.example` is a template.
+1. Install: `pip install .`
+2. Copy `env.example` to `.env` and set a long random `MASTER_SECRET`.
+3. Load `.env` into the environment and start: `python -m message_broker.broker`.
+4. Put a reverse proxy in front of it. `nginx.conf.example` is a template. It limits `POST /sessions` to 10 requests per minute per address.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BASE_DOMAIN` | required | Base domain. A token is the first label before it. |
-| `MASTER_SECRET` | required | Secret that permits `/register`. |
+| `MASTER_SECRET` | required | Secret that permits `POST /sessions`. |
 | `HOST` | `127.0.0.1` | Address to listen on. |
 | `PORT` | `8080` | Port to listen on. |
-| `RUN_TTL` | `21600` | Hard limit in seconds on a run. Heartbeats do not extend it. |
-| `VERBOSE` | unset | Set to `1` to log every request. Lifecycle events and auth failures always log. |
-| `LEASE_SECONDS` | `120` | Seconds a run lives without `POST /heartbeat`. `0` turns the lease off. |
+| `RUN_TTL` | `21600` | Hard limit in seconds on a session. Heartbeats do not extend it. |
+| `LEASE_SECONDS` | `120` | Seconds a session lives without a heartbeat. `0` turns the lease off. |
+| `BROKER_<NAME>` | see `Limits` | Any other limit, for example `BROKER_QUEUE_BYTES`, `BROKER_SENDER_SHARE`, `BROKER_ACK_TIMEOUT`. |
 
-## Deploy
+The default store keeps everything in memory in one process. A restart ends every session.
 
-1. Create a wildcard DNS record for `*.<base-domain>` that points to the broker host.
-2. Get a wildcard TLS certificate for `*.<base-domain>`.
-3. Copy `nginx.conf.example` to the nginx configuration. Set the domain and the certificate paths.
-4. Copy `env.example` to `.env`. Set `BASE_DOMAIN` and a long random `MASTER_SECRET`.
-5. Install the dependencies: `pip install -r requirements.txt`.
-6. Load `.env` into the environment and start the broker: `python broker.py`.
+## Run the Flower adapters
 
-The nginx configuration forwards the `Host` header, because the broker reads the token from it. It limits `/register` to 10 requests per minute per address (burst 5), so a guessing attack shows up as `429` lines in the nginx error log and cannot flood the broker log. It also sets `X-Forwarded-For` to the real client address, which the broker logs. It also allows request bodies up to 1 GB, turns off buffering, and sets a read timeout above the broker timeouts.
+The launcher gives each node a connection string (`BROKER_URL`). Each adapter exits with status 0 when the session ends.
 
-## Server endpoints
-
-Send these to `<server-token>.<base-domain>`. Every endpoint except `/register` needs the header `X-Run-Secret: <run_secret>`.
-
-| Method and path | Request | Response |
+| Adapter | Command | Settings |
 |---|---|---|
-| `POST /register` | Header `X-Master-Secret`. | `200` with `{"run_secret": "..."}`. `403` for a wrong secret. `409` if the token exists. |
-| `POST /mint` | JSON `{"n": 1..64}`. | `{"tokens": [...]}`. Each token is a client token. |
-| `GET /status` | None. | JSON map of client token to `true` or `false`. A value is `true` after that SuperNode registers. |
-| `POST /revoke` | None. | `204`. The run ends. Also `204` if the run is already gone. |
-| `GET /next` | None. | Waits up to 25 seconds. `204` if no work. Otherwise `200` with the request body and the headers that follow. |
-| `POST /reply/{rid}` | Response body. Headers `X-Status` and `X-Resp-Headers` (JSON). | `204`. |
-| `POST /heartbeat` | None. | `200` with `{"remaining": seconds}`. Renews the lease. `403` if the run is gone. |
-| `GET /stats` | None. | Request count and average milliseconds for each path. |
+| Beside the SuperLink | `python -m message_broker.adapters.flower hub` | `BROKER_URL`, `SUPERLINK` (default `http://127.0.0.1:8000`), `POLLERS` (default 16) |
+| Beside each SuperNode | `python -m message_broker.adapters.flower spoke` | `BROKER_URL`, `LISTEN_PORT`, `LISTEN_HOST` (default `127.0.0.1`) |
 
-Headers on a `/next` response:
+Point each SuperNode at its adapter: `flower-supernode --insecure --superlink 127.0.0.1:<LISTEN_PORT>`.
 
-- `X-Req-Id`: the ID to use in `/reply/{rid}`.
-- `X-Req-Path`: the Fleet path to replay.
-- `X-Req-Headers`: the request headers, as JSON.
+## Use it from Python
 
-## Client endpoints
+```python
+from message_broker import Endpoint, Reply, connect
 
-Send `POST` requests to `<client-token>.<base-domain>`. The broker accepts only these paths. Any other path gets `404`.
-
-```
-/v1/fleet/register-node
-/v1/fleet/activate-node
-/v1/fleet/deactivate-node
-/v1/fleet/unregister-node
-/v1/fleet/send-node-heartbeat
-/v1/fleet/pull-messages
-/v1/fleet/push-messages
-/v1/fleet/get-run
-/v1/fleet/get-fab
-/v1/fleet/push-object
-/v1/fleet/pull-object
-/v1/fleet/confirm-message-received
+conn = connect("https://<credential>@broker.example.com/<session_id>")  # or set BROKER_URL
+endpoint = Endpoint(conn, handler)      # handler(src, payload, meta) -> Reply, on the answering side
+await endpoint.start()
+reply = await endpoint.call("hub", b"request", {"k": "v"})   # on the calling side
 ```
 
-Error responses:
+The launcher registers a session, mints one credential per node and hands each node its connection string. See spec section 4.
 
-| Status | Cause |
-|---|---|
-| `404` | Unknown token, or a path that is not in the allowlist. |
-| `503` | The wrapper has not polled `/next` for more than 30 seconds. |
-| `504` | The wrapper did not reply within 60 seconds. |
+## Tests
 
-## Liveness
+`pip install -e ".[test]"` then `pytest`.
 
-`GET /alive` needs no secret. Send it to any server or client token host. It does not renew the lease.
+- `tests/test_api_conformance.py` runs against a broker called directly and over HTTP.
+- `tests/test_store.py` runs against every store. To add a store, add it to `STORES`.
+- `tests/test_endpoint.py` injects faults (duplicates, lost replies) and checks that every call runs once.
+- `tests/test_http.py` covers the HTTP layer and checks `docs/openapi.yaml` against the real routes.
+- `tests/test_flower_adapter.py` runs the adapter against a fake SuperLink.
+- `tests/test_flower_e2e.py` trains a real Flower app through a real broker (about a minute). It is skipped unless Flower is installed: `pip install -e ".[e2e]"`.
+- `tests/test_flower_faults.py` does the same with duplicated and lost traffic, and with forced SuperNode retries of `push-messages`.
 
-| Status | Meaning |
-|---|---|
-| `200` | `{"remaining": seconds}`. The run is live. |
-| `410` | The run expired, was revoked, or the token is unknown. |
-| `404` | The host has no valid token label. |
+## Measure it
 
-Test: `python smoke_test.py`.
+`python bench/load.py --spokes 32 --upload-mb 20` runs a broker and many nodes and prints heartbeat latency, transfer time and broker memory. `--hub-rate 10` limits the hub's link in MB/s, shared by the answers in transit. `--hub-pollers N` sets the hub's concurrent receives. `--lose-recv 0.05` loses that share of the hub's answers. `--phases baseline` runs only some phases. `--env BROKER_QUEUE_BYTES=8388608` changes a broker limit (any `Limits` field works as `BROKER_<NAME>`). Results are in spec section 12.1.

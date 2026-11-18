@@ -1,30 +1,28 @@
-# Rate limit only /register: it is the one unauthenticated way to guess the master secret.
-# An empty key is not limited, so Fleet, /next and /alive traffic is never throttled.
-map $uri $register_key {
-    default   "";
-    /register $binary_remote_addr;
+# Rate limit only POST /sessions: it is the one way to guess the master secret without a credential.
+# An empty key is not limited, so frame traffic is never throttled.
+map "$request_method $uri" $register_key {
+    default            "";
+    "POST /sessions"   $binary_remote_addr;
 }
 limit_req_zone $register_key zone=register:1m rate=10r/m;
 
-# One server block for every token: <token>.broker.example.com -> broker on loopback.
 server {
     listen 443 ssl;
-    server_name *.broker.example.com;
+    server_name broker.example.com;  # one name; credentials travel in the Authorization header
 
     ssl_certificate     /etc/letsencrypt/live/broker.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/broker.example.com/privkey.pem;
 
-    client_max_body_size 1g;        # matches the broker's client_max_size
-    proxy_request_buffering off;    # stream large model updates instead of spooling to disk
-    proxy_buffering off;
-    proxy_read_timeout 120s;        # above the 25s long poll and the 60s request timeout
+    client_max_body_size 8m;        # above max_frame (4 MiB) plus the server's allowance
+    proxy_request_buffering off;
+    proxy_buffering off;            # recv is a long poll
+    proxy_read_timeout 60s;         # above the 30 s longest long poll
 
     location / {
         limit_req zone=register burst=5 nodelay;  # over the limit: 429, one line in nginx error.log
         limit_req_status 429;
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;  # the broker reads the token from this
         proxy_set_header X-Forwarded-For $remote_addr;  # overwrite, not append: logged by the broker
     }
 }

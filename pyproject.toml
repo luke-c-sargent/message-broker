@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "message-broker"
+version = "0.0.0"
+description = "A broker for outbound-only message passing between nodes that cannot accept inbound connections"
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.9"]  # the HTTP broker and client need aiohttp; the rest is stdlib
+
+[project.optional-dependencies]
+e2e = ["flwr==1.43.0", "numpy"]
+test = ["pytest", "pytest-asyncio", "pytest-timeout", "hypothesis", "pyyaml", "openapi-spec-validator"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+timeout = 30
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

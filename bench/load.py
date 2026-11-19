@@ -140,7 +140,7 @@ async def main() -> None:
     ap.add_argument("--repeat", type=int, default=1, help="repeat the upload phase, to see whether memory keeps growing")
     ap.add_argument("--env", action="append", default=[], help="NAME=value for the broker process, repeatable")
     a = ap.parse_args()
-    env = {**os.environ, "MASTER_SECRET": "m", "PORT": str(a.port), "LEASE_SECONDS": "0"}
+    env = {**os.environ, "MASTER_SECRET": "m", "PORT": str(a.port), "BROKER_LEASE": "0"}
     env.update(kv.split("=", 1) for kv in a.env)
     broker = subprocess.Popen([sys.executable, "-m", "message_broker.broker"], env=env,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

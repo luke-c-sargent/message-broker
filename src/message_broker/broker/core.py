@@ -1,6 +1,6 @@
 """Broker core: sessions, credentials, address rules, lease and TTL, sender stamping, limits, lanes, waiting,
-presence. It holds all the policy. Entries live in a Store, which only queues; the core keeps a small ledger of
-every entry (lane, sender, size, expiry) so quotas and expiry are exact whatever store sits behind it.
+presence. It holds all the policy. Entries live in a Store, which only queues; the core keeps a ledger (ledger.py)
+of every entry so quotas and expiry are exact whatever store sits behind it.
 
 Lanes: each address has two queues in the store, `small` (frames up to `small_frame_bytes`, such as heartbeats)
 and `bulk` (the rest). Each lane has its own limits, and `recv` serves both, so a small frame never waits
@@ -9,7 +9,6 @@ behind a queue full of large ones."""
 import asyncio
 import hashlib
 import hmac
-import heapq
 import re
 import secrets
 import time
@@ -18,10 +17,10 @@ from typing import Callable
 
 from ..errors import BrokerError
 from ..types import HOURS, KiB, MINUTES, SECONDS, SPEC_VERSION, Delivery, Info, MiB
+from .ledger import BULK, SMALL, Ledger, Lane
 from .store import Entry, MemoryStore, Store
 
 ADDRESS = re.compile(r"[A-Za-z0-9_-]{1,64}")
-SMALL, BULK = 0, 1  # lanes. The store queue of a lane: the address, or the address plus "#bulk" (no address has a #)
 
 
 @dataclass
@@ -38,7 +37,7 @@ class Limits:  # every default is provisional (spec section 12)
     ack_timeout: float = 5 * SECONDS
     recv_recheck: float = 0.5 * SECONDS  # a waiting recv looks again this often (a store redelivers silently)
     lease: float = 2 * MINUTES  # 0 turns the lease off
-    ttl: float = 6 * HOURS
+    session_ttl: float = 6 * HOURS  # a hard limit on a session's life
     recv_batch_bytes: int = 8 * MiB
 
 
@@ -47,19 +46,12 @@ def _h(cred: str) -> str:  # store hashes so a lookup does not leak the credenti
 
 
 @dataclass
-class _Lane:
-    frames: int = 0  # queued + delivered-but-unacked
-    bytes: int = 0
-    by_sender: dict = field(default_factory=dict)  # src -> [frames, bytes]
-
-
-@dataclass
 class _Node:
     address: str
     cred: str  # hash
     joined: bool = False
     last_seen: float | None = None
-    lanes: tuple = field(default_factory=lambda: (_Lane(), _Lane()))
+    lanes: tuple = field(default_factory=lambda: (Lane(), Lane()))  # SMALL, BULK
     wake: asyncio.Event = field(default_factory=asyncio.Event)  # set when something may be ready for recv
 
 
@@ -71,9 +63,7 @@ class _Session:
     ttl_deadline: float
     nodes: dict = field(default_factory=dict)  # address -> _Node
     by_cred: dict = field(default_factory=dict)  # hash -> _Node
-    bytes: int = 0  # bulk lane, all addresses
-    ledger: dict = field(default_factory=dict)  # entry id -> (node, lane, src, size)
-    expiry: list = field(default_factory=list)  # heap of (expires, entry id)
+    ledger: Ledger = None  # what is queued, and the limits that follow from it
 
 
 class BrokerCore:
@@ -116,32 +106,16 @@ class BrokerCore:
         return s, node
 
     @staticmethod
-    def _queue(address: str, lane: int) -> str:
+    def _queue(address: str, lane: int) -> str:  # the address, or the address plus "#bulk" (no address has a #)
         return address + "#bulk" if lane == BULK else address
-
-    def _release(self, s: _Session, entry_id: int) -> None:
-        meta = s.ledger.pop(entry_id, None)  # None: already released (acked or expired)
-        if meta:
-            node, lane, src, size = meta
-            c = node.lanes[lane]
-            c.frames -= 1
-            c.bytes -= size
-            c.by_sender[src][0] -= 1
-            c.by_sender[src][1] -= size
-            if lane == BULK:
-                s.bytes -= size
-
-    def _expire(self, s: _Session) -> None:
-        """Release entries whose ttl ended, so limits count only frames that can still be delivered."""
-        while s.expiry and s.expiry[0][0] <= self.now():
-            self._release(s, heapq.heappop(s.expiry)[1])
 
     # ---- control plane -------------------------------------------------------------------
     async def register(self, master_secret: str) -> tuple[str, str]:
         if not hmac.compare_digest(master_secret.encode(), self.master):
             raise BrokerError("unauthorized")
         now, sid, cred = self.now(), secrets.token_hex(16), secrets.token_urlsafe(32)
-        self.sessions[sid] = _Session(sid, _h(cred), now + (self.lim.lease or float("inf")), now + self.lim.ttl)
+        self.sessions[sid] = _Session(sid, _h(cred), now + (self.lim.lease or float("inf")), now + self.lim.session_ttl,
+                                      ledger=Ledger(self.lim))
         await self.store.create(sid)
         return sid, cred
 
@@ -168,7 +142,7 @@ class BrokerCore:
             s, _ = self._auth(sid, cred, admin=True)
             self._drop(s)
 
-    async def heartbeat(self, sid: str, cred: str) -> float:
+    async def renew(self, sid: str, cred: str) -> float:
         s, _ = self._auth(sid, cred, admin=True)
         if self.lim.lease:
             s.lease_deadline = self.now() + self.lim.lease
@@ -180,12 +154,14 @@ class BrokerCore:
 
     async def presence(self, sid: str, cred: str) -> dict:
         s, _ = self._auth(sid, cred, admin=True)
-        return {a: {"joined": n.joined, "last_seen": n.last_seen} for a, n in s.nodes.items()}
+        now = self.now()
+        return {a: {"joined": n.joined, "idle": None if n.last_seen is None else now - n.last_seen}
+                for a, n in s.nodes.items()}
 
     async def stats(self, sid: str, cred: str) -> dict:
         s, _ = self._auth(sid, cred, admin=True)
-        self._expire(s)
-        return {"session_bytes": s.bytes,
+        s.ledger.expire(self.now())
+        return {"session_bytes": s.ledger.bulk_bytes,
                 "nodes": {a: {"frames": sum(c.frames for c in n.lanes), "bytes": sum(c.bytes for c in n.lanes)}
                           for a, n in s.nodes.items()}}
 
@@ -196,10 +172,6 @@ class BrokerCore:
             self._live(sid)
 
     # ---- data plane ----------------------------------------------------------------------
-    def connection(self, sid: str, cred: str):
-        from ..client.connection import BoundConnection  # the core does not otherwise depend on the client
-        return BoundConnection(self, sid, cred)
-
     async def info(self, sid: str, cred: str) -> Info:
         self._auth(sid, cred)
         return Info(SPEC_VERSION, self.lim.max_frame, self.lim.frame_ttl)
@@ -213,31 +185,16 @@ class BrokerCore:
             raise BrokerError("too_large", f"{len(frame)} > {lim.max_frame}")
         if ttl is not None and ttl <= 0:
             raise BrokerError("bad_frame", "ttl must be positive")
-        self._expire(s)
+        s.ledger.expire(now)
         lane = SMALL if len(frame) <= lim.small_frame_bytes else BULK
-        c = to.lanes[lane]
-        cap_bytes, floor = ((lim.small_queue_bytes, lim.small_frame_bytes) if lane == SMALL
-                            else (lim.queue_bytes, lim.max_frame))
-        ps = c.by_sender.setdefault(me.address, [0, 0])
-        if (c.frames + 1 > lim.queue_frames or c.bytes + len(frame) > cap_bytes
-                or (lane == BULK and s.bytes + len(frame) > lim.session_bytes)
-                or ps[0] + 1 > max(1, int(lim.queue_frames * lim.sender_share))
-                or ps[1] + len(frame) > max(floor, int(cap_bytes * lim.sender_share))):
-            raise BrokerError("queue_full", dest)
         self._entry_ids += 1
         eid, expires = self._entry_ids, now + min(ttl or lim.frame_ttl, lim.frame_ttl)
-        s.ledger[eid] = (to, lane, me.address, len(frame))  # count first: the push below awaits
-        heapq.heappush(s.expiry, (expires, eid))
-        c.frames += 1
-        c.bytes += len(frame)
-        ps[0] += 1
-        ps[1] += len(frame)
-        if lane == BULK:
-            s.bytes += len(frame)
+        if not s.ledger.admit(eid, to.lanes[lane], lane, me.address, len(frame), expires):  # counted before the push awaits
+            raise BrokerError("queue_full", dest)
         try:
             await self.store.push(sid, self._queue(dest, lane), Entry(eid, me.address, frame, expires))
         except BaseException:
-            self._release(s, eid)
+            s.ledger.release(eid)
             raise
         me.joined, me.last_seen = True, now
         to.wake.set()
@@ -265,7 +222,7 @@ class BrokerCore:
         end = self.now() + wait
         while True:
             s, me = self._auth(sid, cred, admin=False)  # raises session_gone once the session ends
-            self._expire(s)
+            s.ledger.expire(self.now())
             me.wake.clear()  # before looking: a send after this sets it again
             got = await self._take(s, me)
             if got:
@@ -286,4 +243,4 @@ class BrokerCore:
             mine = [i >> 1 for i in ids if i & 1 == lane]
             if mine:
                 for eid in await self.store.ack(sid, self._queue(me.address, lane), mine):
-                    self._release(s, eid)
+                    s.ledger.release(eid)

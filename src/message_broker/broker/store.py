@@ -7,6 +7,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
+from ..types import SECONDS
+
+TIDY_EVERY = 1 * SECONDS  # a queue nobody pops is still cleaned this often, on push
+
 
 @dataclass
 class Entry:
@@ -39,6 +43,7 @@ class Store(Protocol):
 class _Queue:
     queue: deque = field(default_factory=deque)  # of Entry
     inflight: dict = field(default_factory=dict)  # delivery_id -> (Entry, ack deadline)
+    tidied: float = float("-inf")  # when _tidy last ran
 
 
 class MemoryStore:
@@ -53,10 +58,13 @@ class MemoryStore:
     async def push(self, sid: str, queue: str, entry: Entry) -> None:
         qs = self._q.get(sid)
         if qs is not None:
-            qs.setdefault(queue, _Queue()).queue.append(entry)
+            q = qs.setdefault(queue, _Queue())
+            q.queue.append(entry)
+            if self.now() >= q.tidied + TIDY_EVERY:  # else a node that never reads would keep expired frames
+                self._tidy(q)
 
     def _tidy(self, q: _Queue) -> None:
-        now = self.now()
+        now = q.tidied = self.now()
         for did, (e, deadline) in sorted(q.inflight.items(), reverse=True):  # newest first: appendleft keeps order
             if deadline <= now:
                 del q.inflight[did]
@@ -88,3 +96,7 @@ class MemoryStore:
 
     async def purge(self, sid: str) -> None:
         self._q.pop(sid, None)
+
+    def holds(self, sid: str, queue: str) -> int:  # entries kept, queued or delivered: for tests
+        q = self._q.get(sid, {}).get(queue)
+        return len(q.queue) + len(q.inflight) if q else 0

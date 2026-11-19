@@ -1,5 +1,5 @@
-"""Mailbox conformance (spec section 12). Every backend runs the same tests: add one to BACKENDS.
-A backend object needs: register, mint, revoke, heartbeat, alive, presence, stats, node(sid, cred)."""
+"""Mailbox conformance (spec section 13). Every backend runs the same tests: add one to BACKENDS.
+A backend object needs: register, mint, revoke, renew, alive, presence, stats, node(sid, cred)."""
 
 import asyncio
 import time
@@ -9,6 +9,7 @@ import pytest
 from aiohttp.test_utils import TestServer
 
 from message_broker import Limits, BrokerError, BrokerCore
+from message_broker.client import BoundConnection
 from message_broker.client.http import BrokerClient
 from message_broker.broker.server import make_app
 
@@ -60,7 +61,7 @@ async def make(request, clock):
 async def session(mb, *addrs):
     sid, admin = await mb.register(SECRET)
     creds = await mb.mint(sid, admin, list(addrs))
-    return sid, admin, {a: mb.connection(sid, c) for a, c in creds.items()}
+    return sid, admin, {a: BoundConnection(mb, sid, c) for a, c in creds.items()}
 
 
 def frame(n: int = 1) -> bytes:
@@ -90,12 +91,12 @@ async def test_node_cannot_use_admin_operations(make):
     sid, admin, n = await session(mb, "a", "b")
     node_cred = n["a"].cred
     assert await code(mb.mint(sid, node_cred, ["c"])) == "forbidden"
-    assert await code(mb.heartbeat(sid, node_cred)) == "forbidden"
+    assert await code(mb.renew(sid, node_cred)) == "forbidden"
     assert await code(mb.presence(sid, node_cred)) == "forbidden"
     assert await code(mb.send(sid, admin, "a", b"x", None)) == "forbidden"  # the admin is not a node
     assert await code(mb.recv(sid, admin, 0)) == "forbidden"
-    assert await code(mb.heartbeat(sid, "nonsense")) == "unauthorized"
-    assert await code(mb.heartbeat("no-such-session", admin)) == "session_gone"
+    assert await code(mb.renew(sid, "nonsense")) == "unauthorized"
+    assert await code(mb.renew("no-such-session", admin)) == "session_gone"
 
 
 async def test_nodes_and_sessions_are_isolated(make):
@@ -187,36 +188,38 @@ async def test_mint_rules(make):
     old = n["a"].cred
     new = (await mb.mint(sid, admin, ["a"]))["a"]  # a has not joined: a repeat rotates the credential
     assert new != old
-    assert await code(mb.connection(sid, old).recv(0)) == "unauthorized"
-    await mb.connection(sid, new).recv(0)  # joins
+    assert await code(BoundConnection(mb, sid, old).recv(0)) == "unauthorized"
+    await BoundConnection(mb, sid, new).recv(0)  # joins
     assert await code(mb.mint(sid, admin, ["a"])) == "conflict"
 
 
 async def test_presence_and_alive(make, clock):
     mb = await make()
     sid, admin, n = await session(mb, "a", "b")
-    assert (await mb.presence(sid, admin))["a"] == {"joined": False, "last_seen": None}
+    assert (await mb.presence(sid, admin))["a"] == {"joined": False, "idle": None}
     await n["a"].send("b", b"x")
     p = await mb.presence(sid, admin)
     assert p["a"]["joined"] and not p["b"]["joined"]
     assert await mb.alive(sid, n["b"].cred) > 0
+    clock.skew += 5
+    assert 5 <= (await mb.presence(sid, admin))["a"]["idle"] < 6  # seconds since last seen, not a raw clock
 
 
-async def test_lease_heartbeat_ttl_and_revoke(make, clock):
-    mb = await make(lease=10, ttl=100)
+async def test_lease_renewal_ttl_and_revoke(make, clock):
+    mb = await make(lease=10, session_ttl=100)
     sid, admin, n = await session(mb, "a", "b")
     clock.skew += 8
-    await mb.heartbeat(sid, admin)
+    await mb.renew(sid, admin)
     clock.skew += 8
     await mb.alive(sid, admin)  # renewed
     clock.skew += 3
     assert await code(mb.alive(sid, admin)) == "session_gone"  # lease lapsed
-    mb = await make(lease=0, ttl=100)
+    mb = await make(lease=0, session_ttl=100)
     sid, admin, n = await session(mb, "a", "b")
     clock.skew += 99
     await mb.alive(sid, admin)
     clock.skew += 2
-    assert await code(mb.alive(sid, admin)) == "session_gone"  # hard ttl, heartbeats do not extend it
+    assert await code(mb.alive(sid, admin)) == "session_gone"  # hard ttl, renewals do not extend it
     mb = await make()
     sid, admin, n = await session(mb, "a", "b")
     pending = asyncio.ensure_future(n["b"].recv(5))

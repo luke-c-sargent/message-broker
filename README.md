@@ -4,7 +4,7 @@ Nodes that cannot accept inbound connections can still exchange messages. Every 
 
 The design and the glossary are in [docs/spec.md](docs/spec.md). The HTTP endpoints are in [docs/openapi.yaml](docs/openapi.yaml).
 
-Requirements: Python 3.10 or newer.
+Requirements: Python 3.10 or newer. The fast tests pass on 3.10, 3.11 and 3.12 (macOS); Linux and the Flower end-to-end tests on 3.10 and 3.11 are not tested.
 
 ## Layout
 
@@ -12,11 +12,12 @@ Requirements: Python 3.10 or newer.
 |---|---|---|
 | `frames.py`, `errors.py`, `types.py` | Frame format, error codes, shared types. | done |
 | `broker/core.py` | Sessions, credentials, limits, lease. All the policy. | done |
+| `broker/ledger.py` | What is queued, and the limits and expiry that follow from it. | done |
 | `broker/store.py` | The store interface and the in-memory store. | done |
 | `broker/server.py` | The broker's HTTP API. | done |
 | `client/http.py` | HTTP client for a broker, and `connect()`. | done |
 | `client/endpoint.py` | A node's RPC calls over a connection. | done |
-| `client/launcher.py` | The launcher role: register, mint, heartbeat, wait for nodes, revoke. | done |
+| `client/launcher.py` | The launcher role: register, mint, renew the lease, wait for nodes, revoke. | done |
 | `adapters/flower.py` | Flower adapter: `hub` beside the SuperLink, `spoke` beside each SuperNode. | done |
 | Stream channels | For byte tunnels (FLARE). | not started |
 | FLARE adapter | Needs stream channels. | not started |
@@ -34,9 +35,7 @@ Requirements: Python 3.10 or newer.
 | `MASTER_SECRET` | required | Secret that permits `POST /sessions`. |
 | `HOST` | `127.0.0.1` | Address to listen on. |
 | `PORT` | `8080` | Port to listen on. |
-| `RUN_TTL` | `21600` | Hard limit in seconds on a session. Heartbeats do not extend it. |
-| `LEASE_SECONDS` | `120` | Seconds a session lives without a heartbeat. `0` turns the lease off. |
-| `BROKER_<NAME>` | see `Limits` | Any other limit, for example `BROKER_QUEUE_BYTES`, `BROKER_SENDER_SHARE`, `BROKER_ACK_TIMEOUT`. |
+| `BROKER_<NAME>` | see `Limits` | Any limit, for example `BROKER_SESSION_TTL` (hard limit on a session, default 6 hours), `BROKER_LEASE` (seconds without a lease renewal, default 120; `0` turns the lease off), `BROKER_QUEUE_BYTES`, `BROKER_SENDER_SHARE`, `BROKER_ACK_TIMEOUT`. |
 
 The default store keeps everything in memory in one process. A restart ends every session.
 
@@ -46,8 +45,8 @@ The launcher gives each node a connection string (`BROKER_URL`). Each adapter ex
 
 | Adapter | Command | Settings |
 |---|---|---|
-| Beside the SuperLink | `python -m message_broker.adapters.flower hub` | `BROKER_URL`, `SUPERLINK` (default `http://127.0.0.1:8000`), `POLLERS` (default 16) |
-| Beside each SuperNode | `python -m message_broker.adapters.flower spoke` | `BROKER_URL`, `LISTEN_PORT`, `LISTEN_HOST` (default `127.0.0.1`) |
+| Beside the SuperLink | `python -m message_broker.adapters.flower hub` | `BROKER_URL`, `SUPERLINK` (default `http://127.0.0.1:8000`), `POLLERS` (receives at once, default 4), `SUPERLINK_CALLS` (calls to the SuperLink at once, default 16) |
+| Beside each SuperNode | `python -m message_broker.adapters.flower spoke` | `BROKER_URL`, `LISTEN_PORT`, `LISTEN_HOST` (default `127.0.0.1`), `POLLERS` (receives at once, default 2) |
 
 Point each SuperNode at its adapter: `flower-supernode --insecure --superlink 127.0.0.1:<LISTEN_PORT>`.
 
@@ -78,4 +77,4 @@ The launcher registers a session, mints one credential per node and hands each n
 
 ## Measure it
 
-`python bench/load.py --spokes 32 --upload-mb 20` runs a broker and many nodes and prints heartbeat latency, transfer time and broker memory. `--hub-rate 10` limits the hub's link in MB/s, shared by the answers in transit. `--hub-pollers N` sets the hub's concurrent receives. `--lose-recv 0.05` loses that share of the hub's answers. `--phases baseline` runs only some phases. `--env BROKER_QUEUE_BYTES=8388608` changes a broker limit (any `Limits` field works as `BROKER_<NAME>`). Results are in spec section 12.1.
+`python bench/load.py --spokes 32 --upload-mb 20` runs a broker and many nodes and prints heartbeat latency, transfer time and broker memory. `--hub-rate 10` limits the hub's link in MB/s, shared by the answers in transit. `--hub-pollers N` sets the hub's concurrent receives. `--lose-recv 0.05` loses that share of the hub's answers. `--phases baseline` runs only some phases. `--env BROKER_QUEUE_BYTES=8388608` changes a broker limit (any `Limits` field works as `BROKER_<NAME>`). Results are in [docs/measurements.md](docs/measurements.md).

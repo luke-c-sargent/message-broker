@@ -4,7 +4,6 @@ import asyncio
 from contextlib import asynccontextmanager
 
 import aiohttp
-import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 

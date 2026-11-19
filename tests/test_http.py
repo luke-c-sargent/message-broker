@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from aiohttp import web
 from aiohttp.test_utils import TestServer
 from openapi_spec_validator import validate
 
@@ -84,6 +85,19 @@ async def test_garbage_requests_get_error_codes_not_500s():
         with pytest.raises(BrokerError) as e:
             await http._call("GET", f"/sessions/{sid}/alive")  # no credential
         assert e.value.code == "unauthorized"
+    finally:
+        await http.close()
+        await server.close()
+
+
+async def test_a_reply_without_a_broker_body_is_a_clean_error_not_a_retry():
+    server = TestServer(web.Application())  # not a broker: every path is a plain 404
+    await server.start_server()
+    http = BrokerClient(str(server.make_url("")))
+    try:
+        with pytest.raises(BrokerError) as e:
+            await http.info("s", "c")
+        assert e.value.code == "unknown_dest"  # not "unavailable", which an endpoint retries forever
     finally:
         await http.close()
         await server.close()

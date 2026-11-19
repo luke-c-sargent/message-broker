@@ -8,6 +8,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from message_broker import Limits, BrokerError, BrokerCore, Reply, Endpoint
+from message_broker.client import BoundConnection
 
 FAST = dict(backoff=(0.01, 0.05), poll_wait=0.2)
 
@@ -56,8 +57,8 @@ async def pair(limits=None, wrap=lambda n: n, handler=None, start_server=True, w
         calls.append((src, payload))
         return Reply(payload, "ok", {"seen": meta.get("k", "")})
 
-    server = Endpoint(wrap(mb.connection(sid, creds["hub"])), handler or echo, **FAST, **kw)
-    client = Endpoint((wrap_client or wrap)(mb.connection(sid, creds["c1"])), **FAST, **kw)
+    server = Endpoint(wrap(BoundConnection(mb, sid, creds["hub"])), handler or echo, **FAST, **kw)
+    client = Endpoint((wrap_client or wrap)(BoundConnection(mb, sid, creds["c1"])), **FAST, **kw)
     await client.start()
     if start_server:
         await server.start()
@@ -66,6 +67,24 @@ async def pair(limits=None, wrap=lambda n: n, handler=None, start_server=True, w
     finally:
         await client.close()
         await server.close()
+
+
+def test_closed_channel_memory_is_pruned_from_the_front_and_not_on_every_frame():
+    now = [0.0]
+    ep = Endpoint(None, clock=lambda: now[0])
+    ep.frame_ttl = 5
+    for i in range(3):
+        now[0] = float(i)
+        ep._tomb[("a", f"c{i}")] = now[0] + 2 * ep.frame_ttl  # forgotten at 10, 11, 12
+    now[0] = 10.5
+    ep._prune()
+    assert list(ep._tomb) == [("a", "c1"), ("a", "c2")]
+    now[0] = 11.2  # c1 is due, but the last prune was under PRUNE_EVERY ago
+    ep._prune()
+    assert len(ep._tomb) == 2
+    now[0] = 12.0
+    ep._prune()
+    assert not ep._tomb
 
 
 async def test_rpc_roundtrip_with_meta():

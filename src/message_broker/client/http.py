@@ -9,11 +9,12 @@ from urllib.parse import unquote, urlsplit
 import aiohttp
 
 from ..errors import CODES, BrokerError
-from ..types import Delivery, Info
+from ..types import SECONDS, Delivery, Info
 from .connection import BoundConnection
 
-FALLBACK = {401: "unauthorized", 403: "forbidden", 410: "session_gone", 409: "conflict", 429: "queue_full",
-            413: "too_large", 400: "bad_frame"}  # a reply with no JSON body: a proxy or the wrong server
+REPLY_GRACE = 30 * SECONDS  # a call may take this long beyond its long-poll `wait`
+FALLBACK = {401: "unauthorized", 403: "forbidden", 410: "session_gone", 404: "unknown_dest", 409: "conflict",
+            429: "queue_full", 413: "too_large", 400: "bad_frame"}  # a reply with no JSON body: a proxy or the wrong server
 
 
 class BrokerClient:
@@ -31,7 +32,7 @@ class BrokerClient:
         headers.update(kw.pop("headers", {}))
         try:
             async with self._http.request(method, self.base + path, headers=headers, **kw,
-                                          timeout=aiohttp.ClientTimeout(total=wait + 30)) as r:
+                                          timeout=aiohttp.ClientTimeout(total=wait + REPLY_GRACE)) as r:
                 body = await r.read()
                 if r.status >= 400:
                     try:
@@ -58,8 +59,8 @@ class BrokerClient:
     async def revoke(self, sid: str, cred: str) -> None:
         await self._call("DELETE", f"/sessions/{sid}", cred)
 
-    async def heartbeat(self, sid: str, cred: str) -> float:
-        return (await self._json("POST", f"/sessions/{sid}/heartbeat", cred))["remaining"]
+    async def renew(self, sid: str, cred: str) -> float:
+        return (await self._json("POST", f"/sessions/{sid}/renew", cred))["remaining"]
 
     async def alive(self, sid: str, cred: str) -> float:
         return (await self._json("GET", f"/sessions/{sid}/alive", cred))["remaining"]
@@ -71,9 +72,6 @@ class BrokerClient:
         return await self._json("GET", f"/sessions/{sid}/stats", cred)
 
     # ---- data plane ----------------------------------------------------------------------
-    def connection(self, sid: str, cred: str) -> BoundConnection:
-        return BoundConnection(self, sid, cred)
-
     async def info(self, sid: str, cred: str) -> Info:
         d = await self._json("GET", f"/sessions/{sid}/info", cred)
         return Info(d["spec_version"], d["max_frame"], d["frame_ttl"])

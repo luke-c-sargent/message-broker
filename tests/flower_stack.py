@@ -33,7 +33,7 @@ async def until_up(port: int, timeout: float = 30) -> None:
             return
         except OSError:
             if asyncio.get_running_loop().time() > end:
-                raise TimeoutError(f"nothing listening on {port}")
+                raise TimeoutError(f"nothing listening on {port}") from None
             await asyncio.sleep(0.2)
 
 
@@ -63,7 +63,7 @@ class FlowerStack:
     async def start(self) -> "FlowerStack":
         bport, lport = free_port(), free_port()
         self.start_proc("broker", [sys.executable, "-m", "message_broker.broker"], MASTER_SECRET="m",
-                        PORT=str(bport), LEASE_SECONDS="0", **self.broker_env)
+                        PORT=str(bport), BROKER_LEASE="0", **self.broker_env)
         await until_up(bport)
         broker = f"http://127.0.0.1:{bport}"
         self.launch = await Launcher(broker, "m", ["hub"] + [f"c{i}" for i in range(self.n)]).__aenter__()

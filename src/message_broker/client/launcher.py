@@ -12,8 +12,8 @@ from .http import BrokerClient
 class Launcher:
     """Use as `async with Launcher(url, secret, ["hub", "c1"]) as launch:`. The session ends on exit."""
 
-    def __init__(self, base_url: str, master_secret: str, addresses: list[str], beat: float = 30 * SECONDS):
-        self.base, self.secret, self.addresses, self.beat = base_url.rstrip("/"), master_secret, addresses, beat
+    def __init__(self, base_url: str, master_secret: str, addresses: list[str], renew_every: float = 30 * SECONDS):
+        self.base, self.secret, self.addresses, self.renew_every = base_url.rstrip("/"), master_secret, addresses, renew_every
         self.client = BrokerClient(self.base)
         self.gone = asyncio.Event()  # set when the broker says the session is over
         self.sid = self.admin = None
@@ -23,7 +23,7 @@ class Launcher:
     async def __aenter__(self) -> "Launcher":
         self.sid, self.admin = await self.client.register(self.secret)
         self._creds = await self.client.mint(self.sid, self.admin, self.addresses)
-        self._task = asyncio.ensure_future(self._heartbeat())
+        self._task = asyncio.ensure_future(self._renew())
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -34,13 +34,13 @@ class Launcher:
             pass  # the session may already be gone
         await self.client.close()
 
-    async def _heartbeat(self) -> None:
+    async def _renew(self) -> None:
         while True:
-            await asyncio.sleep(self.beat)
+            await asyncio.sleep(self.renew_every)
             try:
-                await self.client.heartbeat(self.sid, self.admin)
+                await self.client.renew(self.sid, self.admin)
             except BrokerError as e:
-                if e.code not in ("unavailable", "queue_full"):  # a network blip is retried next beat
+                if e.code not in ("unavailable", "queue_full"):  # a network blip is retried next time
                     self.gone.set()
                     return
 

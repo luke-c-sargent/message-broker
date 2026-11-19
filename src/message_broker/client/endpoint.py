@@ -16,6 +16,11 @@ from ..types import SECONDS, MiB
 from .connection import Connection
 
 log = logging.getLogger("message_broker.endpoint")
+POLLERS = 4  # concurrent recv calls (docs/measurements.md: few, so a slow link is not asked for more than ack_timeout allows)
+POLL_WAIT = 25 * SECONDS  # one long poll
+RPC_DEADLINE = 25 * SECONDS  # under Flower's 30 s call timeout (spec 11.1)
+PRUNE_EVERY = 1 * SECONDS  # closed-channel memory is cleaned at most this often, not on every frame
+HEADER_SLACK = 64  # bytes: a later frame's header may be longer (a larger seq, `more`)
 TRANSPORT = (OSError, asyncio.TimeoutError)  # network trouble: same as `unavailable`
 
 
@@ -64,15 +69,16 @@ class _Call:
 
 
 class Endpoint:
-    def __init__(self, conn: Connection, handler: Handler | None = None, *, pollers: int = 4,
-                 poll_wait: float = 25 * SECONDS, rpc_deadline: float = 25 * SECONDS, reorder_bytes: int = 64 * MiB,
+    def __init__(self, conn: Connection, handler: Handler | None = None, *, pollers: int = POLLERS,
+                 poll_wait: float = POLL_WAIT, rpc_deadline: float = RPC_DEADLINE, reorder_bytes: int = 64 * MiB,
                  backoff: tuple[float, float] = (0.05 * SECONDS, 0.25 * SECONDS), clock: Callable[[], float] = time.monotonic):
         self.conn, self.handler, self.pollers, self.poll_wait = conn, handler, pollers, poll_wait
         self.rpc_deadline, self.reorder_bytes, self.backoff, self.now = rpc_deadline, reorder_bytes, backoff, clock
         self._prefix, self._n = secrets.token_hex(4), itertools.count()  # channel ids are never reused
         self._calls: dict[tuple[str, str], _Call] = {}
         self._inbound: dict[tuple[str, str], _Rx] = {}
-        self._tomb: dict[tuple[str, str], float] = {}  # closed inbound channels -> forget-after time
+        self._tomb: dict[tuple[str, str], float] = {}  # closed inbound channels -> forget-after time (rising: oldest first)
+        self._pruned = float("-inf")
         self._tasks: set[asyncio.Task] = set()
         self._error: BrokerError | None = None
         self._closed = asyncio.Event()
@@ -127,7 +133,7 @@ class Endpoint:
     async def _send_message(self, dest: str, ch: str, payload: bytes, *, rsp: bool, status: str | None,
                             meta: dict, ttl: float, until: float) -> None:
         first = Header(ch, 0, "close" if rsp else "open", None if rsp else "rpc", False, rsp, status, meta)
-        room = self.max_frame - 4 - len(encode(first)) - 64  # 64: room for a longer seq and `more`
+        room = self.max_frame - 4 - len(encode(first)) - HEADER_SLACK
         if room <= 0:
             raise ValueError("meta is too large for max_frame")
         view, count = memoryview(payload), max(1, -(-len(payload) // room))  # chunks are views: no copy of the message
@@ -187,7 +193,13 @@ class Endpoint:
 
     def _prune(self) -> None:
         now = self.now()
-        for k in [k for k, t in self._tomb.items() if t <= now]:
+        if now < self._pruned + PRUNE_EVERY:
+            return
+        self._pruned = now
+        while self._tomb:  # forget times only rise, so the expired ones are all at the front
+            k = next(iter(self._tomb))
+            if self._tomb[k] > now:
+                break
             del self._tomb[k]
         for k in [k for k, rx in self._inbound.items() if rx.seen + 2 * self.frame_ttl <= now]:
             del self._inbound[k]  # a message that never completed (the opener gave up)

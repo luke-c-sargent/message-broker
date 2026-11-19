@@ -73,7 +73,7 @@ paths:
         "403": {$ref: "#/components/responses/Error"}
         "409": {$ref: "#/components/responses/Error"}
         "410": {$ref: "#/components/responses/Error"}
-  /sessions/{sid}/heartbeat:
+  /sessions/{sid}/renew:
     parameters:
       - {$ref: "#/components/parameters/sid"}
     post:
@@ -106,10 +106,10 @@ paths:
                 type: object
                 additionalProperties:
                   type: object
-                  required: [joined, last_seen]
+                  required: [joined, idle]
                   properties:
                     joined: {type: boolean}
-                    last_seen: {type: number, nullable: true, description: "Broker clock, in seconds."}
+                    idle: {type: number, nullable: true, description: "Seconds since the node last sent, received or acked. Null if it has not joined."}
         "401": {$ref: "#/components/responses/Error"}
         "403": {$ref: "#/components/responses/Error"}
         "410": {$ref: "#/components/responses/Error"}

@@ -3,7 +3,6 @@ Run it with: MASTER_SECRET=... python -m message_broker.broker"""
 
 import asyncio
 import dataclasses
-import json
 import logging
 import os
 import struct
@@ -18,6 +17,8 @@ log = logging.getLogger("message_broker.broker")
 STATUS = {"unauthorized": 401, "forbidden": 403, "session_gone": 410, "unknown_dest": 404, "conflict": 409,
           "queue_full": 429, "too_large": 413, "bad_frame": 400, "unavailable": 503}
 MAX_WAIT = 30 * SECONDS  # longest long poll the server holds, whatever the client asks
+SWEEP_EVERY = 1 * SECONDS  # how often sessions past their lease or ttl are dropped
+RETRY_AFTER = 1 * SECONDS  # sent with queue_full
 
 
 def _ip(request: web.Request) -> str | None:
@@ -58,7 +59,7 @@ async def errors(request: web.Request, handler) -> web.StreamResponse:
     except BrokerError as e:
         if e.code in ("unauthorized", "forbidden"):
             log.warning("%s %s %s denied: %s", _ip(request), request.method, request.path, e)
-        headers = {"Retry-After": "1"} if e.code == "queue_full" else {}
+        headers = {"Retry-After": str(int(RETRY_AFTER))} if e.code == "queue_full" else {}
         return web.json_response({"error": e.code, "detail": e.detail}, status=STATUS[e.code], headers=headers)
     except web.HTTPRequestEntityTooLarge:
         return web.json_response({"error": "too_large", "detail": "body too large"}, status=413)
@@ -88,9 +89,9 @@ def make_app(core: BrokerCore) -> web.Application:
         log.info("session %s revoked", sid(q)[:6])
         return web.Response(status=204)
 
-    @r.post("/sessions/{sid}/heartbeat")
-    async def heartbeat(q):
-        return web.json_response({"remaining": await core.heartbeat(sid(q), _cred(q))})
+    @r.post("/sessions/{sid}/renew")
+    async def renew(q):
+        return web.json_response({"remaining": await core.renew(sid(q), _cred(q))})
 
     @r.get("/sessions/{sid}/alive", allow_head=False)
     async def alive(q):
@@ -124,9 +125,9 @@ def make_app(core: BrokerCore) -> web.Application:
             src = d.src.encode()
             heads.append(struct.pack(">IQB", 9 + len(src) + len(d.frame), d.delivery_id, len(src)) + src)
         resp = web.StreamResponse(headers={"Content-Type": "application/octet-stream"})
-        resp.content_length = sum(len(h) + len(d.frame) for h, d in zip(heads, got))
+        resp.content_length = sum(len(h) + len(d.frame) for h, d in zip(heads, got, strict=True))
         await resp.prepare(q)
-        for h, d in zip(heads, got):  # write the frames as they are: no concatenated copy
+        for h, d in zip(heads, got, strict=True):  # write the frames as they are: no concatenated copy
             await resp.write(h)
             await resp.write(d.frame)
         return resp
@@ -143,7 +144,7 @@ def make_app(core: BrokerCore) -> web.Application:
     async def sweeper(app):
         async def loop():
             while True:
-                await asyncio.sleep(1)
+                await asyncio.sleep(SWEEP_EVERY)
                 core.sweep()
         task = asyncio.ensure_future(loop())
         yield
@@ -157,8 +158,8 @@ def make_app(core: BrokerCore) -> web.Application:
 
 
 def limits_from_env() -> Limits:
-    """LEASE_SECONDS and RUN_TTL, and any other limit as BROKER_<NAME> (for example BROKER_SENDER_SHARE=1.0)."""
-    lim = Limits(lease=float(os.environ.get("LEASE_SECONDS", Limits.lease)), ttl=float(os.environ.get("RUN_TTL", Limits.ttl)))
+    """Any limit as BROKER_<NAME>, for example BROKER_LEASE=0 or BROKER_SENDER_SHARE=1.0."""
+    lim = Limits()
     for f in dataclasses.fields(Limits):
         raw = os.environ.get(f"BROKER_{f.name.upper()}")
         if raw is not None:

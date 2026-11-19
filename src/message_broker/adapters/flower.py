@@ -18,6 +18,10 @@ from ..errors import BrokerError
 from ..types import SECONDS, MiB
 
 HUB = "hub"  # the address the orchestrator gives the SuperLink-side node (spec section 11)
+SUPERLINK_URL = "http://127.0.0.1:8000"
+SUPERLINK_CALLS = 16  # calls to the SuperLink at once
+SUPERLINK_WAIT = 0.5 * SECONDS  # between tries while the SuperLink is not up
+SPOKE_POLLERS = 2  # a spoke needs more than one, so a small reply is not stuck behind a large one (hub: Endpoint default)
 FLEET = {  # allowlist, enforced on the hub side: keeps the unauthenticated Control/Runtime APIs off the broker
     f"/v1/fleet/{p}"
     for p in (
@@ -36,8 +40,8 @@ STATUS = {"session_gone": 403, "unauthorized": 403, "forbidden": 403, "timeout":
           "conflict": 502}
 
 
-def spoke_app(endpoint: Endpoint, hub: str = HUB, deadline: float = 25 * SECONDS) -> web.Application:
-    """The local server a SuperNode talks to. The deadline stays under Flower's 30 s call timeout."""
+def spoke_app(endpoint: Endpoint, hub: str = HUB, deadline: float | None = None) -> web.Application:
+    """The local server a SuperNode talks to. `deadline` defaults to the endpoint's (under Flower's 30 s call timeout)."""
     async def forward(request: web.Request) -> web.Response:
         if request.method != "POST":
             return web.Response(status=405)
@@ -57,7 +61,7 @@ def spoke_app(endpoint: Endpoint, hub: str = HUB, deadline: float = 25 * SECONDS
     return app
 
 
-def hub_handler(local: str, http: aiohttp.ClientSession, limit: int = 16, timeout: float = 20 * SECONDS):
+def hub_handler(local: str, http: aiohttp.ClientSession, limit: int = SUPERLINK_CALLS, timeout: float = 20 * SECONDS):
     """Handler for the hub's Endpoint. `limit` bounds the calls in flight to the local SuperLink."""
     sem = asyncio.Semaphore(limit)
 
@@ -77,16 +81,17 @@ def hub_handler(local: str, http: aiohttp.ClientSession, limit: int = 16, timeou
     return handle
 
 
-async def run_hub(conn, local: str = "http://127.0.0.1:8000", limit: int = 16, poll_wait: float = 25 * SECONDS) -> BrokerError:
-    """Serve until the session ends. Returns the reason."""
+async def run_hub(conn, local: str = SUPERLINK_URL, limit: int = SUPERLINK_CALLS, **endpoint_options) -> BrokerError:
+    """Serve until the session ends. Returns the reason. `limit` is how many calls to the SuperLink run at once.
+    `endpoint_options` go to the Endpoint (`pollers`: spec 7.4 and docs/measurements.md)."""
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as http:
         while True:  # do not join the session until the SuperLink is up
             try:
                 async with http.get(local + "/"):
                     break
             except aiohttp.ClientError:
-                await asyncio.sleep(0.5)
-        endpoint = Endpoint(conn, hub_handler(local, http, limit), pollers=limit, poll_wait=poll_wait)
+                await asyncio.sleep(SUPERLINK_WAIT)
+        endpoint = Endpoint(conn, hub_handler(local, http, limit), **endpoint_options)
         try:
             await endpoint.start()
             return await endpoint.wait_closed()
@@ -96,9 +101,9 @@ async def run_hub(conn, local: str = "http://127.0.0.1:8000", limit: int = 16, p
             await endpoint.close()
 
 
-async def run_spoke(conn, port: int, host: str = "127.0.0.1", poll_wait: float = 25 * SECONDS) -> BrokerError:
+async def run_spoke(conn, port: int, host: str = "127.0.0.1", **endpoint_options) -> BrokerError:
     """Serve a SuperNode until the session ends. Returns the reason."""
-    endpoint = Endpoint(conn, pollers=4, poll_wait=poll_wait)
+    endpoint = Endpoint(conn, **{"pollers": SPOKE_POLLERS, **endpoint_options})
     runner = web.AppRunner(spoke_app(endpoint), access_log=None)
     await runner.setup()
     try:
@@ -113,14 +118,15 @@ async def run_spoke(conn, port: int, host: str = "127.0.0.1", poll_wait: float =
 
 
 def main() -> None:
-    """hub: BROKER_URL, SUPERLINK (default http://127.0.0.1:8000), POLLERS (default 16).
-    spoke: BROKER_URL, LISTEN_PORT, LISTEN_HOST (default 127.0.0.1)."""
+    """hub: BROKER_URL, SUPERLINK, POLLERS, SUPERLINK_CALLS. spoke: BROKER_URL, LISTEN_PORT, LISTEN_HOST, POLLERS (default 2).
+    Defaults are the constants above and in client/endpoint.py."""
+    opts = {"pollers": int(os.environ["POLLERS"])} if "POLLERS" in os.environ else {}
     role = sys.argv[1] if len(sys.argv) > 1 else ""
     if role == "hub":
-        coro = run_hub(connect(), os.environ.get("SUPERLINK", "http://127.0.0.1:8000"),
-                       int(os.environ.get("POLLERS", 16)))
+        coro = run_hub(connect(), os.environ.get("SUPERLINK", SUPERLINK_URL),
+                       int(os.environ.get("SUPERLINK_CALLS", SUPERLINK_CALLS)), **opts)
     elif role == "spoke":
-        coro = run_spoke(connect(), int(os.environ["LISTEN_PORT"]), os.environ.get("LISTEN_HOST", "127.0.0.1"))
+        coro = run_spoke(connect(), int(os.environ["LISTEN_PORT"]), os.environ.get("LISTEN_HOST", "127.0.0.1"), **opts)
     else:
         sys.exit("usage: python -m message_broker.adapters.flower hub|spoke")
     err = asyncio.run(coro)

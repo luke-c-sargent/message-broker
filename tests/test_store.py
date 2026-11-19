@@ -34,6 +34,16 @@ def entry(i, frame=b"x", ttl=100, clock=None):
     return Entry(i, "a", frame, (clock() if clock else time.monotonic()) + ttl)
 
 
+async def test_expired_entries_leave_a_queue_nobody_pops(store, clock):
+    await store.push("s", "b", entry(1, ttl=1, clock=clock))
+    await store.pop("s", "b", 100, 5)  # delivered, never acked
+    await store.push("s", "b", entry(2, ttl=1, clock=clock))
+    clock.skew += 10
+    await store.push("s", "b", entry(3, ttl=100, clock=clock))
+    assert store.holds("s", "b") == 1  # the push dropped 1 and 2; no pop was needed
+    assert [e.id for _, e in await store.pop("s", "b", 100, 5)] == [3]
+
+
 async def test_push_pop_ack(store):
     await store.push("s", "b", entry(1, b"one"))
     await store.push("s", "b", entry(2, b"two"))

@@ -2,7 +2,7 @@
 
 Evidence for the provisional parameters in spec section 12. Not part of the specification.
 
-Everything here was measured on one machine (Apple M3 Max, 16 cores, 64 GB, macOS, Python 3.12), over loopback or a modelled link. Nothing was measured on a real network or on Linux. The load generator is `bench/load.py`.
+Everything here was measured on one machine (Apple M3 Max, 16 cores, 64 GB, macOS, Python 3.12), over loopback or a modelled link. Sections 1 and 2 were not measured on a real network or on Linux; section 3 was. The load generator is `bench/load.py`.
 
 ## 1. Bursts, memory and faults
 
@@ -70,7 +70,7 @@ What this shows:
 
 1. **The collapse is redelivery outrunning delivery.** 16 pollers each hold up to 8 MiB, which is 128 MiB in flight. At 10 MB/s that takes 13 s to arrive, longer than the 5 s `ack_timeout`. The broker redelivers frames still arriving, and nothing completes. The rule in section 7.4 (`ack_timeout > p × B ÷ R`) predicts it.
 2. **The lanes work.** With a long enough `ack_timeout` the median heartbeat is 33 ms on a congested link, where it was 5 s before the lanes (section 1).
-3. **The tail is heartbeats that ride in a mixed answer.** A heartbeat popped in the same batch as bulk frames arrives only when the whole answer has. With 16 pollers that is several seconds. Fewer pollers and a smaller batch shrink it (p99 1.75 s at `p` = 2, batch 4 MiB). A `recv` for the small lane alone would remove it. That is not built (spec section 14, item 9).
+3. **The tail is heartbeats that ride in a mixed answer.** A heartbeat popped in the same batch as bulk frames arrives only when the whole answer has. With 16 pollers that is several seconds. Fewer pollers and a smaller batch shrink it (p99 1.75 s at `p` = 2, batch 4 MiB). A `recv` for the small lane alone would remove it. That is not built (spec section 14, limitation 1).
 4. **Fewer pollers on the hub cost nothing on a fast link.** On loopback with no throttle (32 spokes, 20 MB each): upload 401 MB/s and download 490 MB/s with 16 pollers, 374 and 511 with 4. Heartbeat p99 stayed under 250 ms either way. Before the lanes it was 390 to 500 MB/s.
 
 **The re-check.** A waiting `recv` looks again every `recv_recheck` because a store redelivers silently. Test: 32 spokes, 5 % of the hub's `recv` answers lost, `ack_timeout` 1 s, a heartbeat every second.
@@ -85,3 +85,49 @@ What this shows:
 | 2 s | 1025 ms | 3 % | 2030 ms | 2 % |
 
 The p99 of about 1 s is the `ack_timeout` itself: a lost answer costs one visibility timeout. The re-check adds little because the timers of 16 pollers are staggered, so together they look 16 times as often. A lone poller waits up to a whole re-check on top (2.0 s at a 2 s re-check). At 0.5 s that is hidden by the timeout. Shorter than 0.25 s costs CPU for no gain. Longer than 1 s only matters to a node with one poller. **0.5 s stays the default.**
+
+## 3. A live server on Linux
+
+Evidence from a deployed broker, with nginx and TLS in front, as in `nginx.conf.example`. Taken on 2026-11-19. The server: 2 vCPU, 15 GB, Ubuntu with Python 3.12.3 and aiohttp 3.14.5, one broker process with the default limits. The deployed code was identical to the working tree. The load generator (`bench/load.py --url`) ran in one process, either on the server itself (no WAN) or on a laptop (a WAN link of 7 to 9 MB/s). The generator shared the 2 vCPUs with nginx and the broker when it ran on the server, so the throughput figures are low for this hardware. "Broker CPU" is a share of one core. "Heartbeat" is as in section 1.
+
+**Bursts on the server.** Each spoke uploads, then downloads, a message of the stated size. Heartbeats continue throughout.
+
+| Path | Spokes x size | Upload rate | Upload heartbeat p50 / p99 | Broker CPU | Download rate | Download heartbeat p50 / p99 | Broker RSS peak |
+|---|---|---|---|---|---|---|---|
+| direct to the broker (no nginx, no TLS) | 32 x 20 MB | 211 MB/s | 145 ms / 408 ms | 99 % | 276 MB/s | 291 ms / 708 ms | 541 MB |
+| through nginx and TLS | 32 x 20 MB | 73 to 74 MB/s | 728 to 776 ms / 1.3 to 2.3 s | 46 % | 99 MB/s | 1.1 s / 3.4 s | 555 MB |
+| through nginx and TLS | 63 x 10 MB | 54 MB/s | 1.05 s / 2.7 s | 43 % | 96 MB/s | 1.8 s / 4.5 s | 509 MB |
+
+No transfer failed and no heartbeat went over 5 s in these runs. With no load, heartbeat p50 was 21 ms direct and 24 ms through nginx. In the 63-spoke run the generator's event-loop lag reached 694 ms, so the generator is part of what was measured.
+
+**Memory.** Six upload bursts in a row (32 x 20 MB, through nginx): the broker's RSS was 470 MB after every one. It did not grow. The peak across all runs was 555 MB, against 1.1 to 1.8 GB for the same burst on macOS (section 1). `session_bytes` is 256 MiB, so on Linux the peak was about twice that.
+
+**A lost answer.** 32 x 20 MB through nginx, with 5 % of the hub's `recv` answers lost (24 in the run) and the default `ack_timeout` of 5 s. Every transfer finished. Heartbeats did not keep to 5 s:
+
+| Phase | Heartbeat p99 | Heartbeats over 5 s |
+|---|---|---|
+| no load | 5.6 s | 32 of 152 |
+| upload | 5.1 s | 8 of 347 |
+| download | 5.5 s | 5 of 141 |
+
+This is the cost found in section 2 ("a lost answer costs one visibility timeout"), now at the default of 5 s instead of 1 s. A heartbeat whose answer was lost comes back after `ack_timeout` plus up to one `recv_recheck`, which is more than the 5 s Flower allows.
+
+**A slow link on the client side.** 32 spokes and the hub on a laptop, 3 MB per transfer, the broker over the WAN:
+
+| Phase | Rate | Heartbeat p50 / p99 | Heartbeats over 5 s |
+|---|---|---|---|
+| no load | | 284 ms / 860 ms | 0 |
+| upload | 7 MB/s | 682 ms / 7.1 s | 32 of 192 |
+| download | 9 MB/s | 732 ms / 1.6 s | 0 |
+
+With 20 MB per transfer on the same link, every upload ran out of its 120 s deadline. The link, not the broker, was the limit: the broker used 8 to 12 % of a core and under 200 MB. The p99 of 7 s is the hub's link, as in section 2, item 3.
+
+**Other findings.**
+
+1. One broker process uses a whole core at about 210 to 280 MB/s (the direct runs). Through nginx and TLS on 2 vCPUs the limit was 54 to 99 MB/s.
+2. A session holds at most 64 nodes. A 129-address `nodes` call (a hub and 128 spokes) gave `bad_frame: at most 64 nodes`.
+3. After a restart the old credentials get `session_gone` (410) at once. A new session registers in under a second.
+4. An unrenewed session was gone 136 s after it started (the lease is 120 s). A renewed one stayed.
+5. nginx: a 4 MiB frame passes intact. A 9 MiB body gets nginx's own 413 (`client_max_body_size 8m`). A long poll with `wait=100` returned 204 after 30.1 s. `POST /sessions` was limited from the sixth request in a burst (429); frame traffic was not limited.
+
+Not measured: the SuperLink's own time, real Flower on separate machines, other stores, and more than one session at once.

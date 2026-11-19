@@ -47,6 +47,19 @@ def cpu_s(pid: int) -> float:
     return sum(float(x) * 60 ** i for i, x in enumerate(reversed(out.split(":")))) if out else 0.0
 
 
+REMOTE: list[str] = []  # ssh argv prefix when the broker is on another host (--ssh)
+
+
+async def proc_stats(pid: int) -> tuple[float, float]:
+    """(rss in MB, cpu seconds) of the broker process, locally or over ssh."""
+    if not REMOTE:
+        return rss_mb(pid), cpu_s(pid)
+    p = await asyncio.create_subprocess_exec(*REMOTE, f"ps -o rss=,cputimes= -p {pid}",
+                                             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out = (await p.communicate())[0].split()
+    return (int(out[0]) / 1024, float(out[1])) if len(out) == 2 else (0.0, 0.0)
+
+
 def pct(xs: list[float], p: float) -> float:
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(len(xs) * p))] if xs else float("nan")
@@ -138,12 +151,28 @@ async def main() -> None:
     ap.add_argument("--lose-recv", type=float, default=0, help="chance the hub's recv answer is lost (a flaky link)")
     ap.add_argument("--phases", default="baseline,upload,download", help="comma list of phases to run")
     ap.add_argument("--repeat", type=int, default=1, help="repeat the upload phase, to see whether memory keeps growing")
+    ap.add_argument("--url", help="use this running broker instead of starting one; the secret is read from $BROKER_MASTER_SECRET")
+    ap.add_argument("--ssh", help="with --url: user@host of the broker, to sample its memory and CPU")
+    ap.add_argument("--ssh-key", help="identity file for --ssh")
     ap.add_argument("--env", action="append", default=[], help="NAME=value for the broker process, repeatable")
     a = ap.parse_args()
     env = {**os.environ, "MASTER_SECRET": "m", "PORT": str(a.port), "BROKER_LEASE": "0"}
     env.update(kv.split("=", 1) for kv in a.env)
-    broker = subprocess.Popen([sys.executable, "-m", "message_broker.broker"], env=env,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    broker, pid, url, secret = None, 0, f"http://127.0.0.1:{a.port}", "m"
+    if a.url:
+        url, secret = a.url, os.environ["BROKER_MASTER_SECRET"]
+        if a.ssh:
+            REMOTE.extend(["ssh", "-F", "/dev/null", "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=auto",
+                           "-o", "ControlPath=/tmp/bench-ssh-%C", "-o", "ControlPersist=60",
+                           *(["-i", a.ssh_key] if a.ssh_key else []), a.ssh])
+            found = subprocess.run([*REMOTE, "pgrep -of message_broker.broker"], capture_output=True, text=True).stdout
+            pid = int(found.split()[0])
+        else:  # the generator runs on the broker's own host
+            pid = int(subprocess.run(["pgrep", "-of", "message_broker.broker"], capture_output=True, text=True).stdout.split()[0])
+    else:
+        broker = subprocess.Popen([sys.executable, "-m", "message_broker.broker"], env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pid = broker.pid
     lag = [0.0]
     big = b"x" * (a.upload_mb * MiB)
 
@@ -159,9 +188,10 @@ async def main() -> None:
             lag[0] = max(lag[0], time.perf_counter() - t - 0.05)
     lagger = None
     try:
-        await until_up(a.port)
+        if not a.url:
+            await until_up(a.port)
         addrs = ["hub"] + [f"s{i}" for i in range(a.spokes)]
-        async with Launcher(f"http://127.0.0.1:{a.port}", "m", addrs) as launch:
+        async with Launcher(url, secret, addrs) as launch:
             conns = {x: connect(launch.connection_string(x)) for x in addrs}
             hub_conn = Throttled(conns["hub"], a.hub_rate) if a.hub_rate else conns["hub"]
             hub_conn = Lossy(hub_conn, a.lose_recv) if a.lose_recv else hub_conn
@@ -189,10 +219,10 @@ async def main() -> None:
 
                 async def sample():
                     while not stop.is_set():
-                        peak[0] = max(peak[0], rss_mb(broker.pid))
-                        await asyncio.sleep(0.25)
+                        peak[0] = max(peak[0], (await proc_stats(pid))[0])
+                        await asyncio.sleep(0.25 if not REMOTE else 0.5)
                 bt, sm = asyncio.ensure_future(beats(ph, stop)), asyncio.ensure_future(sample())
-                ph.t0, cpu0 = time.perf_counter(), cpu_s(broker.pid)
+                ph.t0, cpu0 = time.perf_counter(), (await proc_stats(pid))[1]
                 if work:
                     async def one(ep):
                         t = time.perf_counter()
@@ -205,7 +235,7 @@ async def main() -> None:
                     await asyncio.gather(*(one(s) for s in spokes))
                 else:
                     await asyncio.sleep(a.baseline_s)
-                ph.t1, ph.cpu = time.perf_counter(), cpu_s(broker.pid) - cpu0
+                ph.t1, ph.cpu = time.perf_counter(), (await proc_stats(pid))[1] - cpu0
                 await asyncio.sleep(a.beat_s * 1.5)  # let the last beats finish
                 stop.set()
                 await asyncio.gather(bt, sm)
@@ -217,7 +247,7 @@ async def main() -> None:
             for i in range(a.repeat if "upload" in want else 0):
                 await phase("upload", lambda ep: ep.call("hub", big, {"op": "upload"}, 120))
                 await asyncio.sleep(3)
-                print(f"          broker rss after the burst and 3 s idle: {rss_mb(broker.pid):.0f} MB", flush=True)
+                print(f"          broker rss after the burst and 3 s idle: {(await proc_stats(pid))[0]:.0f} MB", flush=True)
             if "download" in want:
                 await phase("download", lambda ep: ep.call("hub", b"get", {"op": "download"}, 120))
             if a.lose_recv:
@@ -231,8 +261,9 @@ async def main() -> None:
     finally:
         if lagger:
             lagger.cancel()
-        broker.terminate()
-        broker.wait(10)
+        if broker:
+            broker.terminate()
+            broker.wait(10)
 
 
 asyncio.run(main())

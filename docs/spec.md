@@ -10,10 +10,9 @@ A set of nodes that cannot accept inbound connections must exchange messages. A 
 Rules that hold for the whole design:
 
 1. **Outbound only.** Every connection is started by a launcher or a node toward the broker. The broker never starts a connection to anyone.
-2. **One HTTP API.** All communication with a broker is HTTP. Whoever runs the broker chooses the store behind it. Nodes never see it.
+2. **One HTTP API.** All communication with a broker is HTTP. Whoever runs the broker chooses the store behind it.
 3. **The broker is dumb about protocols.** It moves opaque frames from one node address to another. It does not read payloads. It does not know any application protocol, and it has no idea which node plays which application role.
 4. **Protocol work lives in adapters.** An adapter turns one application protocol (Flower, FLARE, others) into channels. The adapters decide who plays which role. They also enforce policy: for example an allowlist of calls, and which senders to accept. Nodes are untrusted.
-5. **Clean break.** This specification replaces the old Host-header token API. There is no compatibility layer.
 
 ## 2. Terms
 
@@ -22,7 +21,7 @@ This glossary is the authority for the words in this specification.
 | Term | Meaning |
 |---|---|
 | **Broker** | A long-running service that carries frames between the nodes of a session, over an HTTP API. It enforces credentials, limits and the lease, keeps its queues in a store, and never starts a connection. |
-| **Store** | The pluggable storage behind a broker: named queues. Nodes never see it. The default is in memory. |
+| **Store** | The pluggable storage behind a broker: named queues. The default is in memory. |
 | **Session** | One use of a broker by a group of nodes, from registration to teardown. A namespace with its own lease, credentials and queues. |
 | **Launcher** | A role, not a program. It registers a session, mints node credentials, produces each node's connection string, renews the lease and ends the session. It may share a process with a node. |
 | **Orchestrator** | Whatever starts the launcher and the node processes and delivers the connection strings to them (a workflow system, a job scheduler, a shell script). Outside this project. |
@@ -40,7 +39,7 @@ This glossary is the authority for the words in this specification.
 | **Endpoint** | The part of a node that speaks the frame protocol: it opens and answers channels, cuts messages into frames, and acknowledges, orders and de-duplicates received frames. It keeps several `recv` calls open, and each loop is a **poller**. |
 | **Lane** | One of an address's two queues: small frames (heartbeats, control calls) and bulk frames (section 7.4). |
 | **Lease** | How long a session may go without a **lease renewal**, which is the launcher's `renew` call. When it runs out, the session ends. |
-| **Session TTL** | A hard limit on a session's life, counted from registration. Lease renewals do not extend it. |
+| **Session TTL** | A hard limit on a session's life, counted from registration. |
 | **Frame TTL** | How long a frame may wait in a queue before the broker drops it (`ttl` on `send`, at most `frame_ttl`). |
 | **Heartbeat** | A small periodic message the application sends to show a node is alive (Flower's `send-node-heartbeat`, FLARE's PING). To the broker it is an ordinary small frame. Not the lease renewal. |
 | **Presence** | Which nodes have joined (sent or received at least once), and when each was last seen. |
@@ -63,7 +62,7 @@ An adapter MUST ignore (drop) a frame whose `src` it does not expect. Example: a
 ### 4.1 Lifecycle
 
 1. The launcher calls `register` with the **master secret**. The broker creates a session and returns the `session_id` and an **admin credential**.
-2. The launcher calls `mint` with the admin credential and a list of addresses. The broker returns one **node credential** for each address. A session holds at most `max_nodes` nodes (*provisional*: 64). `mint` may be called again later to add nodes (late joiners, replacements). If the reply to a `mint` is lost, the launcher repeats the call. An address that has not yet joined (section 9.2) is minted again with a new credential, and the old credential stops working. An address that has already joined returns `conflict`. A `mint` is all or nothing. It returns `bad_frame` for an invalid or duplicate address, or if it would pass `max_nodes`.
+2. The launcher calls `mint` with the admin credential and a list of addresses. The broker returns one **node credential** for each address. A session holds at most `max_nodes` nodes (*provisional*: 64). `mint` may be called again later to add nodes (late joiners, replacements). If the response to a `mint` is lost, the launcher repeats the call. An address that has not yet joined (section 9.2) is minted again with a new credential, and the old credential stops working. An address that has already joined returns `conflict`. A `mint` is all or nothing. It returns `bad_frame` for an invalid or duplicate address, or if it would pass `max_nodes`.
 3. The launcher gives each node a connection string that carries its own credential. How the string reaches a process is the orchestrator's job (an environment variable, a job parameter, a file). Each adapter is also told its own address and its peers' addresses by the orchestrator.
 4. Nodes exchange frames. The launcher renews the lease with the `renew` operation.
 5. The session ends when any of these happens: `revoke` is called; the lease lapses; the session TTL is reached. When a session ends, the broker deletes its credentials and queues. Every channel is closed. Pending `recv` calls return `session_gone`.
@@ -75,7 +74,7 @@ An address is 1 to 64 characters from `A-Z a-z 0-9 _ -`. This keeps addresses sa
 ### 4.2 Lease and session TTL
 
 - **Lease:** the session lives `lease` seconds after the last lease renewal. `lease = 0` turns the lease off.
-- **Session TTL:** a hard limit in seconds on the session, counted from registration. Lease renewals do not extend it.
+- **Session TTL:** `session_ttl` seconds from registration. Lease renewals do not extend it.
 - Only the admin credential may call `renew`.
 - The lease detects that the launcher is gone (a killed task) and stops the session from leaking. Whether the loss of a particular node should end the session is a policy for the launcher. The launcher reads `presence` (section 9.2) and calls `revoke` when its own rule is broken, for example "the hub node has been silent for 60 seconds".
 
@@ -89,12 +88,10 @@ An address is 1 to 64 characters from `A-Z a-z 0-9 _ -`. This keeps addresses sa
 
 The broker enforces these rules for node credentials:
 
-1. **Own mail only.** A node can read only its own address.
+1. **Own address only.** A node can read only its own address.
 2. **Unforgeable sender.** The broker stamps the true sender address (`src`) on every frame. A node cannot choose it.
 3. **Session only.** A node can reach only addresses of its own session.
 4. **No admin.** A node cannot call any admin operation.
-
-The broker enforces these rules, not the store. The conformance tests (section 13) check each one.
 
 ### 4.4 Credential form
 
@@ -114,8 +111,7 @@ A frame is a byte string. It has three parts in this order:
 +------------------+---------------------+----------------+
 ```
 
-The broker treats the whole frame as opaque, except that it enforces the size limit and may parse the header to log. A store that cannot hold raw bytes encodes the frame (for example as base64) inside its own implementation. That cost belongs to that store only.
-
+The broker treats the whole frame as opaque, except that it enforces the size limit and may parse the header to log. 
 ### 5.1 Header fields
 
 | Field | Type | Required | Meaning |
@@ -144,16 +140,16 @@ A channel is a conversation between two nodes. The **opener** chooses `ch` and s
 
 ### 6.1 RPC mode (`mode: rpc`)
 
-One request and one response.
+One request and one reply.
 
-1. The opener sends `open` with the request payload (chunked if needed). Every frame of the request carries a `ttl` equal to the opener's deadline (at most `frame_ttl`, section 7.1). A request that waited longer than its deadline is therefore never delivered.
-2. The responder sends `close` with the response payload and `status` (`ok` or an error code).
+1. The opener sends `open` with the request payload (chunked if needed). Every frame of the request is sent with a `ttl` equal to the opener's deadline (at most `frame_ttl`, section 7.1). A request that waited longer than its deadline is therefore never delivered.
+2. The responder sends `close` with the reply payload and `status` (`ok` or an error code).
 
 The channel is over when the `close` frame is complete. The opener sets a deadline. If it passes, the opener gives up and treats the channel as closed with `timeout`. A late `close` frame for a closed channel is dropped.
 
 ### 6.2 Stream mode (`mode: stream`)
 
-*Design only: not implemented, not measured.*
+*Design only: not implemented.*
 
 An ordered, two-way byte stream.
 
@@ -175,14 +171,14 @@ The broker does not promise order (section 7). The receiving endpoint therefore:
 - delivers frames to the adapter strictly in `seq` order;
 - **remembers closed channels.** When a channel closes, the receiver keeps its `(src, ch)` for `2 × frame_ttl` and drops every frame for it. Without this, a late copy of an `open` (see section 7.1) would look like a new channel and run the request again. The time is enough because an opener's deadline is at most `frame_ttl` and the broker drops any frame older than `frame_ttl`.
 
-Out-of-order delivery is normal. Several consumers may read from one address at the same time (section 7.2), and a frame whose ack was lost comes back only after `ack_timeout`. By then the sender may have delivered many later frames of a large message. The gap is therefore not limited by the number of consumers, so the limit is in bytes: `reorder_bytes` (*provisional*: 64 MiB per channel).
+Out-of-order delivery is normal: consumers compete (section 7.2), and a frame whose ack was lost returns only after `ack_timeout`, by which time many later frames may have arrived. The limit is therefore in bytes, not in consumers: `reorder_bytes` (*provisional*: 64 MiB per channel).
 
 ## 7. Delivery
 
 ### 7.1 Broker guarantee: at least once, with acknowledgement
 
 - `send` returns success only when the broker has accepted the frame into the destination queue. A `send` may carry a `ttl` in seconds. The default and the maximum is `frame_ttl` (*provisional*: 120 s). The broker drops a frame that is still queued when its `ttl` ends, and never delivers it. The broker uses its own clock only, so nodes need no shared clock.
-- `recv` returns frames, each with a `delivery_id`. The consumer calls `ack` as soon as the adapter holds the frame in its own memory. That is **receipt**, not the end of handling, and the ack is its own call, not part of the next `recv`. A frame that is not acknowledged within `ack_timeout` (*provisional*: 5 s) goes back to the queue and may be delivered again, to any consumer of that address. A short timeout is safe because an ack takes one round trip. A consumer that fails after the ack loses the frame. For an RPC the opener's deadline then ends the call, and the application retries as a new channel.
+- `recv` returns frames, each with a `delivery_id`. The consumer calls `ack` as soon as the adapter holds the frame in its own memory. That is **receipt**, not the end of handling, and the ack is its own call, not part of the next `recv`. A frame that is not acknowledged within `ack_timeout` (*provisional*: 5 s) goes back to the queue and may be delivered again, to any consumer of that address. A consumer that fails after the ack loses the frame. For an RPC the opener's deadline then ends the call, and the application retries as a new channel.
 - A sender that does not know whether a `send` worked (a network error) sends the **same frame again, with the same `seq`**. The receiver's duplicate rule (section 6.3) removes the extra copy. A receiver acknowledges a duplicate too, and then drops it.
 
 ### 7.2 Competing consumers
@@ -207,13 +203,11 @@ Version 1 bounds memory in these places. A frame counts against them while it is
 - Each session has a total limit, `session_bytes`, across all its bulk lanes. The small lanes are bounded by their own limits and by `max_nodes`.
 - Each sender has a **share** of each lane's limits: `sender_share` (*provisional*: one quarter, in frames and in bytes).
 
-The limits are per lane so that a queue full of large frames does not refuse an application heartbeat. The share is about fairness under normal load, not only about hostile nodes. At the end of a round many spokes upload large model updates at the same time. Without a share, a few uploads fill the `hub` queue and the small control frames of other nodes (which Flower gives 5 s) get `queue_full`.
+The limits are per lane so that a queue full of large frames does not refuse an application heartbeat. The share is about fairness, not only hostile nodes: when many nodes send large frames at once, a few of them cannot fill an address's queue.
 
 When any limit would be passed, `send` fails with `queue_full`. The sender waits (exponential back-off) and tries again. A stream adapter stops reading from its local socket while a send is waiting. That lets TCP slow the application. Credit-based flow control is not part of version 1.
 
-**Known limit.** Any node can send to any address. A hostile node can use its whole share of every lane, and then other senders still have the rest of each lane, but the lane is smaller for them. This is a denial of service only. It does not expose data, because a node cannot read other addresses and cannot forge `src`. Request-rate limits stay in the reverse proxy.
-
-**Redelivery must not outrun delivery.** A frame is acknowledged only after the node has received the whole `recv` answer. If that takes longer than `ack_timeout`, the broker delivers the frames again while they are still arriving, and a slow link can end in a storm of redeliveries in which nothing completes (`docs/measurements.md`, section 2). Over a link of `R` bytes per second, with `p` concurrent `recv` calls that each take up to `B` bytes, an answer needs about `p × B ÷ R` seconds. `ack_timeout` must be longer than that.
+**Redelivery must not outrun delivery.** A frame is acknowledged only after the node has received the whole `recv` response. If that takes longer than `ack_timeout`, the broker delivers the frames again while they are still arriving, and a slow link can end in a storm of redeliveries in which nothing completes (`docs/measurements.md`, section 2). Over a link of `R` bytes per second, with `p` concurrent `recv` calls that each take up to `B` bytes, a response needs about `p × B ÷ R` seconds. `ack_timeout` must be longer than that.
 
 ## 8. Errors
 
@@ -246,7 +240,7 @@ These are the operations a node can call on a broker, in language-neutral form. 
 | `connect` | connection string | a connection | Fails with `unauthorized` or `session_gone`. |
 | `info` | none | `spec_version`, `max_frame`, `frame_ttl` | A caller refuses a broker whose `spec_version` it does not support. |
 | `send` | `dest`, frame, optional `ttl` | success, or an error | `dest` is any live address of the session. |
-| `recv` | `wait` seconds | a list of `(delivery_id, src, frame)` with at least one entry, or empty after `wait` | Long poll. Reads the caller's own address. The list holds up to `recv_batch_bytes` (*provisional*: 8 MiB) of frames, and always at least one, small-lane frames first (section 7.4). Many calls may run at once. A `delivery_id` is opaque: a node only passes it back to `ack`. |
+| `recv` | `wait` seconds | a list of `(delivery_id, src, frame)` with at least one entry, or empty after `wait` | Long poll. The broker holds it at most 30 s, whatever `wait` says. Reads the caller's own address. The list holds up to `recv_batch_bytes` (*provisional*: 8 MiB) of frames, and always at least one, small-lane frames first (section 7.4). Many calls may run at once. A `delivery_id` is opaque: a node only passes it back to `ack`. |
 | `ack` | list of `delivery_id` | success | Called on receipt (section 7.1). |
 | `close` | none | none | Releases the connection. |
 
@@ -264,15 +258,11 @@ These are the operations a node can call on a broker, in language-neutral form. 
 | `presence` | admin | none | map of address to `{joined, idle}` |
 | `stats` | admin | none | counters per session (frames and bytes per address, session bytes) |
 
-**Presence.** A node is `joined` after its first successful `send` or `recv`. `idle` is the number of seconds since its latest `send`, `recv` or `ack`, or null before it has joined. A launcher that waits for all nodes to join waits for `joined`. A launcher that watches for a silent node reads `idle`. `joined` replaces the old Flower-specific `register-node` flag.
+**Presence.** A node is `joined` after its first successful `send` or `recv`. `idle` is the number of seconds since its latest `send`, `recv` or `ack`, or null before it has joined. A launcher that waits for all nodes to join waits for `joined`. A launcher that watches for a silent node reads `idle`.
 
 ### 9.3 Store interface
 
-The store is internal to a broker. It is not part of the wire protocol. A store is a set of named queues with a visibility timeout. It holds no credentials, applies no limits, knows nothing about lanes and never waits. The broker does all of that.
-
-- **Names.** The broker names the queues. The small lane of an address is the address. Its bulk lane is the address followed by `#bulk`. No address contains `#`. To the store a queue is just a name.
-- **Ledger.** The broker keeps a ledger in memory of every entry it has queued (lane, sender, size, expiry). The ledger makes the limits, the sender share and expiry exact whatever store sits behind the broker. If the broker restarts, the ledger is lost, and so is every session, so nothing that matters is lost.
-- **Waiting.** A `recv` that finds nothing waits in the broker, not in the store. A `send` to that node wakes it. Otherwise it looks again every `recv_recheck` (*provisional*: 0.5 s), because a store redelivers silently when a visibility timeout ends. A store therefore needs no blocking read.
+The store is internal to a broker and not part of the wire protocol. A store is a set of named queues with a visibility timeout. It holds no credentials, applies no limits, knows nothing about lanes and never waits. The broker does all of that: it names the queues, keeps its own in-memory record of what is queued so that limits and expiry are exact whatever the store, and looks again every `recv_recheck` (*provisional*: 0.5 s) in a waiting `recv`, because a store redelivers silently when a visibility timeout ends.
 
 | Operation | Meaning |
 |---|---|
@@ -306,7 +296,7 @@ All requests except `register` carry `Authorization: Bearer <credential>`. There
 
 **`recv` body.** The body is a series of records, each: 4 bytes record length (big-endian), 8 bytes `delivery_id` (big-endian), 1 byte `src` length, the `src` bytes (UTF-8), then the frame bytes (the rest of the record).
 
-**Reverse proxy.** `POST /sessions` is the only way to guess the master secret without a credential. The reverse proxy MUST limit it per source address (`nginx.conf.example` does this).
+**Reverse proxy.** It SHOULD terminate TLS, because credentials travel in headers. It MUST NOT buffer responses (`recv` is a long poll), MUST accept request bodies of at least `max_frame` bytes, and MUST allow a read timeout above 30 s. `POST /sessions` is the only way to guess the master secret without a credential, so it MUST also limit that call per source address. `nginx.conf.example` does all of this.
 
 Error mapping:
 
@@ -322,60 +312,60 @@ Error mapping:
 | `bad_frame` | 400 |
 | `unavailable` | 503 |
 
-An error reply has a JSON body `{"error": <code>, "detail": <text>}`. `recv` is a long poll started by the node. The broker never starts a connection.
+An error reply has a JSON body `{"error": <code>, "detail": <text>}`.
 
 ## 11. Adapters
 
-An adapter is not part of the broker API. These notes record what the first two adapters need from the layers below. Their design is a separate document. In both, the orchestrator tells each adapter its own address and its peers' addresses. The hub has the address `hub`, and the hub adapter replies to the `src` of each frame. Spoke adapters send to `hub` and accept only frames from `hub`. This is the adapters' convention, not the broker's.
+An adapter is not part of the broker API. This section states what the two adapters need from the layers below. Their design is a separate document. In both, the orchestrator tells each adapter its own address and its peers' addresses. The hub has the address `hub`, and the hub adapter replies to the `src` of each frame. Spoke adapters send to `hub` and accept only frames from `hub`. This is the adapters' convention, not the broker's.
 
 ### 11.1 Flower
 
 - **Spoke adapter (beside each SuperNode):** a local HTTP server. The SuperNode connects to `127.0.0.1`. The adapter turns each request into an RPC channel and returns the response. `meta` carries the path and headers.
 - **Hub adapter (beside the SuperLink):** it applies the allowlist of `/v1/fleet/*` paths and replays calls to the local SuperLink.
-- **The spoke adapter must map errors to what the SuperNode accepts** (read from Flower 1.40.0, `flwr/supercore/retry/http_retry.py`):
+- **The spoke adapter must map errors to what the SuperNode accepts** (read from Flower 1.43.0, `flwr/supercore/retry/http_retry.py`):
   - The SuperNode retries forever, with back-off up to 20 s, on 503, 504 and on connect, read, write and pool errors.
   - `403` makes it stop cleanly (`RunNotRunningException`). `401` makes it stop the process.
   - Any other status, including `404`, `410`, `429` and `502`, makes it give up with an error.
   - So `session_gone` MUST become `403`. `queue_full`, `unavailable` and an RPC `timeout` MUST become `503` or `504`. A `429` from the broker MUST NOT reach the SuperNode. `unknown_dest` is a configuration fault and may become `503`.
 - **Time budget:** the SuperNode's default call timeout is 30 s. The heartbeat call (`send-node-heartbeat`) has **5 s**. The broker round trip, plus the hub adapter, plus the SuperLink must answer a heartbeat inside 5 s. The RPC deadline of the adapter should be below 30 s.
-- **Duplicates:** a SuperNode retry after a timeout is a new channel (section 7.3). Tested with Flower 1.43.0 and `quickstart_numpy` (2 SuperNodes, 5 rounds): when the answers to 6 `push-messages` calls were cut, the SuperNodes retried, the SuperLink ran the repeats, and the app finished (`docs/measurements.md`, section 1). One app only.
+- **Duplicates:** a SuperNode retry after a timeout is a new channel (section 7.3), so the SuperLink may run a call twice. The adapter relies on the application's tolerance of that.
 
 ### 11.2 FLARE
 
-*Design only: there is no FLARE adapter yet.*
+*Design only: not implemented.*
 
 - **Method:** a plain byte tunnel for `tcp` (or `http`). FLARE keeps its own mTLS from end to end through the adapters and the broker. The adapters do not end TLS. The broker carries ciphertext.
 - **Spoke adapter (FLARE client site):** it listens on a fixed local address. FLARE connects to it. Each accepted connection opens one stream channel to `hub`.
 - **Hub adapter (FLARE server):** for each opened channel it opens an outbound connection to the local FLARE server port and copies bytes both ways. The adapter never accepts a connection from the network.
-- **What was read in NVFlare (commit 3a7f077):** `get_ssl_context` sets `check_hostname = False` and checks the certificate against the provisioned CA only, so a localhost target does not break the handshake for the tcp driver. The `tcp` driver makes one outbound socket and reads on the same connection. FLARE reconnects a dropped connector by itself, so closing a channel is recoverable.
+- **Assumptions about FLARE (NVFlare commit 3a7f077):** `get_ssl_context` sets `check_hostname = False` and checks the certificate against the provisioned CA only, so a localhost target does not break the handshake for the tcp driver. The `tcp` driver makes one outbound socket and reads on the same connection. FLARE reconnects a dropped connector by itself, so closing a channel is recoverable.
 - **Time budget:** FLARE sends a heartbeat PING after 60 s idle and does not close on a missing reply. A blocked send fails after 30 s (`streaming_send_timeout`) and a stall warning appears after 45 s. The adapter must read its local socket only while the broker accepts data, and a stalled send must not last 30 s.
 - **Limit:** a byte tunnel cannot filter messages. FLARE's own authorization does that.
-- **Not covered:** the `grpc` driver builds its own credentials. A localhost target may fail its host check. This is not tested. Use `tcp` or `http`.
+- **Not supported:** the `grpc` driver builds its own credentials, and a localhost target may fail its host check. Use `tcp` or `http`.
 
 ## 12. Parameters (provisional)
 
-Each one is a setting, and each default is provisional. `docs/measurements.md` (one machine, loopback, a modelled link) supports `ack_timeout`, the back-off, `recv_recheck`, the lanes and the poller count. The others are guesses. Nothing was measured on a real network or on Linux.
+Each one is a setting, and each default is provisional. `docs/measurements.md` supports `ack_timeout`, the back-off, `recv_recheck`, the lanes and the poller count. The others are guesses.
 
-| Parameter | Default | To measure |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `poll_wait` (long poll) | 25 s | Latency of the extra poll hop against the 5 s Flower heartbeat. |
-| `ack_timeout` | 5 s | **Must exceed `p × B ÷ R`** (section 7.4). Too short collapses a slow link (`docs/measurements.md`, section 2). |
-| frame TTL (`frame_ttl`) | 120 s | Longest queue wait that is still useful. Also sets how long closed channels are remembered (`2 ×`). |
-| `sender_share` | 1/4 of the queue limit | Heartbeat latency during a simultaneous upload of model updates. |
-| `coalesce_delay` | 10 ms | Throughput of the FLARE tunnel against added latency. |
-| `recv_batch_bytes` | 8 MiB | Throughput and latency of small frames. |
-| `lease` | 120 s | Lease renewal every 30 s. |
-| session TTL (`session_ttl`) | 6 h | Longest real session. |
-| `max_frame` | 4 MiB | Throughput and memory. FLARE chunks at 1 MB. |
-| queue limit per address, bulk lane | 1024 frames or 64 MiB | Memory per session. |
-| `small_frame_bytes` | 64 KiB | Largest control frame (a Flower heartbeat is far smaller). |
-| queue limit per address, small lane | 1024 frames or 4 MiB | Memory, against the number of small frames a burst sends. |
-| session total limit (bulk lanes) | 256 MiB | Memory per session. |
-| `recv_recheck` | 0.5 s | Measured (`docs/measurements.md`, section 2): longer saves little CPU, shorter helps little. |
-| `reorder_bytes` | 64 MiB per channel | Largest message that must survive a lost ack, against receiver memory. |
-| RPC deadline (Flower adapter) | 25 s | Below 30 s, and the real SuperLink latency. |
-| send back-off | 0.05 s doubling to 0.25 s | Measured (`docs/measurements.md`, section 1): a 5 s cap collapsed throughput on small queues. |
-| `max_nodes` | 64 | Largest federation. |
+| `poll_wait` | 25 s | The `wait` an endpoint asks of each `recv`. |
+| `ack_timeout` | 5 s | Time to acknowledge a delivered frame before it is delivered again. **Must exceed `p × B ÷ R`** (section 7.4). |
+| `frame_ttl` | 120 s | Longest a frame may wait in a queue. A closed channel is remembered for twice this (section 6.3). |
+| `sender_share` | 1/4 | Share of each lane's limits that one sender may use. |
+| `coalesce_delay` | 10 ms | Longest a stream adapter holds bytes before it sends a frame (section 6.2). |
+| `recv_batch_bytes` | 8 MiB | Most frame bytes in one `recv` response. |
+| `lease` | 120 s | Time a session lives after the last lease renewal. A launcher renews every 30 s. |
+| `session_ttl` | 6 h | Hard limit on a session's life. |
+| `max_frame` | 4 MiB | Largest whole frame. FLARE chunks at 1 MB. |
+| `queue_frames`, `queue_bytes` | 1024 frames, 64 MiB | Limit of the bulk lane of one address. |
+| `small_frame_bytes` | 64 KiB | Largest frame of the small lane. |
+| `queue_frames`, `small_queue_bytes` | 1024 frames, 4 MiB | Limit of the small lane of one address. |
+| `session_bytes` | 256 MiB | Limit of all bulk lanes of a session together. |
+| `recv_recheck` | 0.5 s | How often a waiting `recv` looks again (section 9.3). |
+| `reorder_bytes` | 64 MiB per channel | Most payload an endpoint holds for one channel (section 6.3). |
+| RPC deadline | 25 s | Default deadline of an RPC, below the SuperNode's 30 s call timeout (section 11.1). |
+| send back-off | 0.05 s doubling to 0.25 s | Wait after `queue_full` (section 7.4). |
+| `max_nodes` | 64 | Most nodes in a session. |
 
 ## 13. Conformance tests
 
@@ -391,22 +381,16 @@ There are two conformance suites.
 
 **Store conformance** runs against each store. It checks push, pop, ack, the visibility timeout with new delivery ids, expiry, waiting pops and purge.
 
-The endpoint tests add faults (duplicated sends, lost send replies, lost receive responses) and check that every RPC runs exactly once and gets its own reply.
+## 14. Known limitations and out of scope
 
-## 14. Open items and out of scope
+Known limitations:
 
-Open, to settle before or during the first build:
-
-1. **FLARE job-level timeouts.** The client-to-server job heartbeat and cell request timeouts (in `nvflare/private/`) were not read. A slow broker could trip them above the tcp driver.
-2. **FLARE `grpc` driver** over a localhost target (section 11.2).
-3. **Flower duplicate tolerance** is tested for one app only (section 11.1 and `docs/measurements.md`, section 1). Other apps are not tested.
-4. **Rendezvous beyond an environment variable.** The orchestrator delivers connection strings and addresses. Other delivery methods are not specified.
-5. **Stores.** The in-memory store loses everything on restart. External stores (for example NATS) are future work, and the store interface (section 9.3) is provisional until one exists. Several broker processes sharing one store would also need shared session state, which is not designed.
-6. **Flooding.** A hostile node can use its whole share of every queue (section 7.4). Tighter limits are possible if nodes of one session are ever mutually untrusted parties.
-7. **Launcher watchdog.** Which `presence` rules end a session is left to the launcher. A shared library function for the common cases is not specified.
-8. **Stream mode.** Not yet implemented. Coalescing and interaction with a slow consumer are not measured.
-9. **Heartbeats in mixed answers.** A small frame can still ride in a `recv` answer that also carries bulk frames, and waits for the whole answer (`docs/measurements.md`, section 2). A `recv` for the small lane alone, polled by dedicated pollers in the endpoint, would remove that. It changes the HTTP API (a `lane` parameter) and the `recv` operation (section 9.1). Not built.
-10. **Hub pollers.** The Flower hub adapter receives with 4 pollers (`docs/measurements.md`, section 2) and allows 16 calls to the SuperLink at once. If the hub's link to the broker is slower than about 10 MB/s, or batches are larger, `ack_timeout` must grow with `p × B ÷ R` (section 7.4).
+1. **Mixed responses.** A small frame can share a `recv` response with bulk frames and then waits for the whole response (`docs/measurements.md`, section 2). A `recv` for the small lane alone would remove this.
+2. **A lost `recv` response.** If the response is lost after the broker handed over the frames, they return only after `ack_timeout`, so a heartbeat can arrive past Flower's 5 s (`docs/measurements.md`, section 3). A token on `recv`, which lets a client name a lost call, would remove this.
+3. **One process.** With the in-memory store, sessions live in one broker process, and a restart ends them. Several broker processes would need shared session state, which is not designed.
+4. **Flooding.** A hostile node can use its whole share of every lane, which makes each lane smaller for other senders. It cannot read other addresses or forge `src`, so this is denial of service only. Request-rate limits belong to the reverse proxy. Tighter limits are possible if the nodes of one session are ever mutually untrusted.
+5. **Flower duplicates.** A repeated call from a SuperNode runs again at the SuperLink (section 7.3). Tolerance of this is checked for one app only (`docs/measurements.md`, section 1).
+6. **FLARE timeouts.** FLARE's job-level heartbeat and cell request timeouts (in `nvflare/private/`) have not been analysed. A slow broker could trip them.
 
 Out of scope for version 1:
 

@@ -11,7 +11,7 @@ Rules that hold for the whole design:
 
 1. **Outbound only.** Every connection is started by a launcher or a node toward the broker. The broker never starts a connection to anyone.
 2. **One HTTP API.** All communication with a broker is HTTP. Whoever runs the broker chooses the store behind it.
-3. **The broker is dumb about protocols.** It moves opaque frames from one node address to another. It does not read payloads. It does not know any application protocol, and it has no idea which node plays which application role.
+3. **Protocol-agnostic broker.** It moves opaque frames from one node address to another. It does not read payloads, and it does not know which application protocol or role a node has.
 4. **Protocol work lives in adapters.** An adapter turns one application protocol (Flower, FLARE, others) into channels. The adapters decide who plays which role. They also enforce policy: for example an allowlist of calls, and which senders to accept. Nodes are untrusted.
 
 ## 2. Terms
@@ -32,7 +32,7 @@ This glossary is the authority for the words in this specification.
 | **Application** | The system whose traffic is carried (Flower, FLARE). An **application process** is one of its programs (a Flower SuperLink or SuperNode, a FLARE server or client). The application keeps its own role names. This specification uses "client" and "server" for nothing else. |
 | **Adapter** | Code on the same machine as one application process. It speaks the application's protocol to it locally, turns its traffic into messages and enforces policy (allowlists, accepted senders). |
 | **Hub** | The node whose application process every other node's application process talks to (the Flower SuperLink, the FLARE server). Its adapter is the hub adapter. By convention its address is `hub`. "The hub" is the node, and `hub` is its address. |
-| **Spoke** | Any node other than the hub. Its adapter, the spoke adapter, sends only to the hub and drops frames from other senders. Hub and spoke apply only to an application with one such central process. |
+| **Spoke** | Any node other than the hub. Hub and spoke apply only to an application with one such central process. |
 | **Frame** | The unit the broker carries: a header and a payload (section 5). |
 | **Message** | What an adapter hands its endpoint, such as one Flower request or reply. It is cut into frames and put together again by the receiving endpoint. A stream channel carries bytes, not messages. |
 | **Channel** | One conversation between two nodes: RPC (one request, one reply) or stream (ordered bytes both ways). |
@@ -55,7 +55,7 @@ node c3 ──┘                        └── launcher (admin)
    all arrows are connections started toward the broker
 ```
 
-An adapter MUST ignore (drop) a frame whose `src` it does not expect. Example: an adapter on a spoke node accepts frames only from `hub`.
+An adapter MUST ignore (drop) a frame whose `src` it does not expect. Example: the adapter of a spoke sends only to `hub` and accepts frames only from `hub`.
 
 ## 4. Session lifecycle and credentials
 
@@ -111,7 +111,8 @@ A frame is a byte string. It has three parts in this order:
 +------------------+---------------------+----------------+
 ```
 
-The broker treats the whole frame as opaque, except that it enforces the size limit and may parse the header to log. 
+The broker treats the whole frame as opaque, except that it enforces the size limit and may parse the header to log.
+
 ### 5.1 Header fields
 
 | Field | Type | Required | Meaning |
@@ -128,7 +129,7 @@ The broker treats the whole frame as opaque, except that it enforces the size li
 
 The sender does not put its own address in the frame. The broker adds the sender address on delivery (the `src` value of `recv`). A receiver MUST trust `src` and MUST NOT trust any address a sender wrote in `meta`.
 
-Unknown header fields MUST be ignored. That is how the format grows without a version change.
+Unknown header fields MUST be ignored. That is how the frame format grows without a change of its version.
 
 ### 5.2 Size and chunking
 
@@ -171,19 +172,19 @@ The broker does not promise order (section 7). The receiving endpoint therefore:
 - delivers frames to the adapter strictly in `seq` order;
 - **remembers closed channels.** When a channel closes, the receiver keeps its `(src, ch)` for `2 × frame_ttl` and drops every frame for it. Without this, a late copy of an `open` (see section 7.1) would look like a new channel and run the request again. The time is enough because an opener's deadline is at most `frame_ttl` and the broker drops any frame older than `frame_ttl`.
 
-Out-of-order delivery is normal: consumers compete (section 7.2), and a frame whose ack was lost returns only after `ack_timeout`, by which time many later frames may have arrived. The limit is therefore in bytes, not in consumers: `reorder_bytes` (*provisional*: 64 MiB per channel).
+Out-of-order delivery is normal: pollers compete (section 7.2), and a frame whose ack was lost returns only after `ack_timeout`, by which time many later frames may have arrived. The limit is therefore in bytes, not in pollers: `reorder_bytes` (*provisional*: 64 MiB per channel).
 
 ## 7. Delivery
 
 ### 7.1 Broker guarantee: at least once, with acknowledgement
 
 - `send` returns success only when the broker has accepted the frame into the destination queue. A `send` may carry a `ttl` in seconds. The default and the maximum is `frame_ttl` (*provisional*: 120 s). The broker drops a frame that is still queued when its `ttl` ends, and never delivers it. The broker uses its own clock only, so nodes need no shared clock.
-- `recv` returns frames, each with a `delivery_id`. The consumer calls `ack` as soon as the adapter holds the frame in its own memory. That is **receipt**, not the end of handling, and the ack is its own call, not part of the next `recv`. A frame that is not acknowledged within `ack_timeout` (*provisional*: 5 s) goes back to the queue and may be delivered again, to any consumer of that address. A consumer that fails after the ack loses the frame. For an RPC the opener's deadline then ends the call, and the application retries as a new channel.
+- `recv` returns frames, each with a `delivery_id`. The poller calls `ack` as soon as the adapter holds the frame in its own memory. That is **receipt**, not the end of handling, and the ack is its own call, not part of the next `recv`. A frame that is not acknowledged within `ack_timeout` (*provisional*: 5 s) goes back to the queue and may be delivered again, to any poller of that address. A node that fails after the ack loses the frame. For an RPC the opener's deadline then ends the call, and the application retries as a new channel.
 - A sender that does not know whether a `send` worked (a network error) sends the **same frame again, with the same `seq`**. The receiver's duplicate rule (section 6.3) removes the extra copy. A receiver acknowledges a duplicate too, and then drops it.
 
-### 7.2 Competing consumers
+### 7.2 Competing pollers
 
-Several `recv` calls may run at the same time on one address (an adapter may run many pollers). The broker delivers each frame to exactly one of them at a time. Order across consumers is not defined. The endpoint restores order (section 6.3).
+Several pollers may call `recv` at the same time on one address. The broker delivers each frame to exactly one of them at a time. Order across pollers is not defined. The endpoint restores order (section 6.3).
 
 ### 7.3 What the broker does not promise
 
@@ -197,7 +198,7 @@ Each address has two **lanes**: `small`, for frames up to `small_frame_bytes` (*
 
 `recv` serves both lanes. It takes up to half of `recv_batch_bytes` from the small lane first, then gives the rest of the batch to the bulk lane. A lane with less than its half gives the rest to the other. So a small frame never waits behind queued bulk frames, and neither lane can starve the other. A node could cut bulk data into small frames to jump ahead. The small lane's own limits and the half-batch rule limit what that gains.
 
-Version 1 bounds memory in these places. A frame counts against them while it is queued or delivered but not yet acknowledged.
+This specification bounds memory in these places. A frame counts against them while it is queued or delivered but not yet acknowledged.
 
 - Each lane of each address has a limit: `queue_frames` frames, and in bytes `small_queue_bytes` (small lane) or `queue_bytes` (bulk lane).
 - Each session has a total limit, `session_bytes`, across all its bulk lanes. The small lanes are bounded by their own limits and by `max_nodes`.
@@ -205,7 +206,7 @@ Version 1 bounds memory in these places. A frame counts against them while it is
 
 The limits are per lane so that a queue full of large frames does not refuse an application heartbeat. The share is about fairness, not only hostile nodes: when many nodes send large frames at once, a few of them cannot fill an address's queue.
 
-When any limit would be passed, `send` fails with `queue_full`. The sender waits (exponential back-off) and tries again. A stream adapter stops reading from its local socket while a send is waiting. That lets TCP slow the application. Credit-based flow control is not part of version 1.
+When any limit would be passed, `send` fails with `queue_full`. The sender waits (exponential back-off) and tries again. A stream adapter stops reading from its local socket while a send is waiting. That lets TCP slow the application. Credit-based flow control is not part of this specification.
 
 **Redelivery must not outrun delivery.** A frame is acknowledged only after the node has received the whole `recv` response. If that takes longer than `ack_timeout`, the broker delivers the frames again while they are still arriving, and a slow link can end in a storm of redeliveries in which nothing completes (`docs/measurements.md`, section 2). Over a link of `R` bytes per second, with `p` concurrent `recv` calls that each take up to `B` bytes, a response needs about `p × B ÷ R` seconds. `ack_timeout` must be longer than that.
 
@@ -276,7 +277,7 @@ A store needs no ordering guarantee and no per-sender counts, and it needs no pr
 
 ## 10. The broker's HTTP API
 
-The endpoints are defined in `docs/openapi.yaml`. A test checks that the file is valid and matches the real routes. This table is a summary.
+The endpoints are defined in `docs/openapi.yaml`. This table is a summary.
 
 | Operation | Request | Success | Credential |
 |---|---|---|---|
@@ -292,7 +293,7 @@ The endpoints are defined in `docs/openapi.yaml`. A test checks that the file is
 | `recv` | `GET /sessions/{id}/recv?wait=S` | `200`, body = records (below); `204` if empty | node |
 | `ack` | `POST /sessions/{id}/ack`, JSON `{"ids": [...]}` | `204` | node |
 
-All requests except `register` carry `Authorization: Bearer <credential>`. There is no wildcard DNS name and no Host-header parsing. The broker answers no `HEAD` requests, because a `HEAD` on `recv` would take a frame off the queue.
+All requests except `register` carry `Authorization: Bearer <credential>`. The broker answers no `HEAD` requests, because a `HEAD` on `recv` would take a frame off the queue.
 
 **`recv` body.** The body is a series of records, each: 4 bytes record length (big-endian), 8 bytes `delivery_id` (big-endian), 1 byte `src` length, the `src` bytes (UTF-8), then the frame bytes (the rest of the record).
 
@@ -312,11 +313,11 @@ Error mapping:
 | `bad_frame` | 400 |
 | `unavailable` | 503 |
 
-An error reply has a JSON body `{"error": <code>, "detail": <text>}`.
+An error response has a JSON body `{"error": <code>, "detail": <text>}`.
 
 ## 11. Adapters
 
-An adapter is not part of the broker API. This section states what the two adapters need from the layers below. Their design is a separate document. In both, the orchestrator tells each adapter its own address and its peers' addresses. The hub has the address `hub`, and the hub adapter replies to the `src` of each frame. Spoke adapters send to `hub` and accept only frames from `hub`. This is the adapters' convention, not the broker's.
+An adapter is not part of the broker API. This section states what the two adapters need from the layers below.
 
 ### 11.1 Flower
 
@@ -349,6 +350,7 @@ Each one is a setting, and each default is provisional. `docs/measurements.md` s
 | Parameter | Default | Meaning |
 |---|---|---|
 | `poll_wait` | 25 s | The `wait` an endpoint asks of each `recv`. |
+| `pollers` | 4 | Concurrent pollers of one endpoint: `p` in section 7.4. The Flower spoke adapter uses 2. |
 | `ack_timeout` | 5 s | Time to acknowledge a delivered frame before it is delivered again. **Must exceed `p × B ÷ R`** (section 7.4). |
 | `frame_ttl` | 120 s | Longest a frame may wait in a queue. A closed channel is remembered for twice this (section 6.3). |
 | `sender_share` | 1/4 | Share of each lane's limits that one sender may use. |
@@ -375,11 +377,11 @@ There are two conformance suites.
 
 - the four rules of section 4.3 (a node cannot read another address, cannot forge `src`, cannot reach another session, cannot call an admin operation);
 - the size limit, the queue limits, the sender share and `unknown_dest`;
-- at-least-once with ack and redelivery, `ttl` expiry, a late ack of an expired frame, and competing consumers;
+- at-least-once with ack and redelivery, `ttl` expiry, a late ack of an expired frame, and competing pollers;
 - a repeated `mint` of an address that has not joined, and `conflict` for one that has;
 - `revoke`, lease and session TTL behaviour.
 
-**Store conformance** runs against each store. It checks push, pop, ack, the visibility timeout with new delivery ids, expiry, waiting pops and purge.
+**Store conformance** runs against each store. It checks push, pop, ack, the visibility timeout with new delivery ids, expiry, a pop that never waits, and purge.
 
 ## 14. Known limitations and out of scope
 
@@ -392,10 +394,10 @@ Known limitations:
 5. **Flower duplicates.** A repeated call from a SuperNode runs again at the SuperLink (section 7.3). Tolerance of this is checked for one app only (`docs/measurements.md`, section 1).
 6. **FLARE timeouts.** FLARE's job-level heartbeat and cell request timeouts (in `nvflare/private/`) have not been analysed. A slow broker could trip them.
 
-Out of scope for version 1:
+Out of scope for this specification:
 
 - End-to-end encryption by the endpoint. FLARE gets it from mTLS. Flower does not get it yet.
-- Send restrictions between nodes in the broker. Adapters drop frames from unexpected senders.
+- Send restrictions between nodes in the broker (section 3).
 - Broadcast. An adapter sends to each address in turn.
 - Nodes that relay for other nodes (FLARE hierarchies) need no broker change, but are not designed.
 - Connecting to an application deployment that already exists outside the session. A session is created with fresh processes.
